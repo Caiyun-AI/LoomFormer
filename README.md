@@ -7,6 +7,11 @@ This repository contains the official **JAX** training code and **PyTorch** (Hug
 > *Beijing University of Posts and Telecommunications & ColorfulClouds Technology*
 
 <p align="center">
+  🤗 <a href="https://huggingface.co/Caiyun-AI/LoomPythia-2.8B"><b>LoomPythia-2.8B</b></a> &nbsp;|&nbsp;
+  🤗 <a href="https://huggingface.co/Caiyun-AI/mHC-Pythia-2.8B"><b>mHC-Pythia-2.8B</b></a>
+</p>
+
+<p align="center">
   <img src="assets/loomformer_arch.png" width="95%" alt="LoomFormer Architecture"/>
 </p>
 
@@ -29,14 +34,14 @@ Across model scales and token budgets:
 
 ## Pretrained Models & Main Results
 
-We release **[LoomPythia-2.8B](https://huggingface.co/Caiyun-AI/LoomPythia-2.8B)** pretrained on 300B tokens of the Pile on HuggingFace 🤗:
+We release **[LoomPythia-2.8B](https://huggingface.co/Caiyun-AI/LoomPythia-2.8B)** and our matched 4-stream mHC comparison model **[mHC-Pythia-2.8B](https://huggingface.co/Caiyun-AI/mHC-Pythia-2.8B)** (both pretrained on 300B tokens of the Pile) on HuggingFace 🤗:
 
 | Model | Params | Tokens | Pile ppl $\downarrow$ | FLAN ppl $\downarrow$ | 0-shot Avg (10 tasks) $\uparrow$ | 5-shot Avg (10 tasks) $\uparrow$ |
 |---|---:|---:|---:|---:|---:|---:|
-| Pythia-2.8B | 2.78B | 300B | 6.63 | 8.16 | 56.3 | 57.3 |
-| Pythia-6.9B | 6.86B | 300B | 6.29 | 7.85 | 58.1 | 59.3 |
-| mHC-Pythia-2.8B | 2.78B | 300B | 6.24 | 7.35 | 58.8 (+2.5) | 59.9 (+2.6) |
-| Pythia-12B | 11.85B | 300B | **6.01** | 7.26 | **59.9** | 60.8 |
+| [Pythia-2.8B](https://huggingface.co/EleutherAI/pythia-2.8b) | 2.78B | 300B | 6.63 | 8.16 | 56.3 | 57.3 |
+| [Pythia-6.9B](https://huggingface.co/EleutherAI/pythia-6.9b) | 6.86B | 300B | 6.29 | 7.85 | 58.1 | 59.3 |
+| [mHC-Pythia-2.8B](https://huggingface.co/Caiyun-AI/mHC-Pythia-2.8B) | 2.78B | 300B | 6.24 | 7.35 | 58.8 (+2.5) | 59.9 (+2.6) |
+| [Pythia-12B](https://huggingface.co/EleutherAI/pythia-12b) | 11.85B | 300B | **6.01** | 7.26 | **59.9** | 60.8 |
 | **[LoomPythia-2.8B](https://huggingface.co/Caiyun-AI/LoomPythia-2.8B)** | **2.78B** | **300B** | 6.02 | **6.94** | **59.9 (+3.6)** | **61.6 (+4.3)** |
 
 ### Quickstart (HuggingFace Transformers)

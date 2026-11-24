@@ -2,7 +2,7 @@
 
 This directory provides HuggingFace-compatible PyTorch models for **LoomPythia** and **LoomFormer**, together with a **fused Triton + CUDA-graph fast inference engine** (`fast_inference/`) and MaxText checkpoint conversion utilities.
 
-We release **[LoomPythia-2.8B](https://huggingface.co/Caiyun-AI/LoomPythia-2.8B)** (pretrained on 300B Pile tokens) on HuggingFace 🤗.
+We release **[LoomPythia-2.8B](https://huggingface.co/Caiyun-AI/LoomPythia-2.8B)** and the matched 4-stream mHC comparison baseline **[mHC-Pythia-2.8B](https://huggingface.co/Caiyun-AI/mHC-Pythia-2.8B)** (both pretrained on 300B Pile tokens) on HuggingFace 🤗.
 
 ## Installation
 
