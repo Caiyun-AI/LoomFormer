@@ -13,7 +13,7 @@ This repository contains the official **JAX** training code and **PyTorch** (Hug
 </p>
 
 <p align="center">
-  <img src="assets/loomformer_arch.png" width="95%" alt="LoomFormer Architecture"/>
+  <img src="assets/loomformer_weave.gif" width="82%" alt="Loom Attention: Per-Token Circuit Rewiring"/>
 </p>
 
 ## About
@@ -21,6 +21,10 @@ This repository contains the official **JAX** training code and **PyTorch** (Hug
 Transformers solve tasks by composing attention heads across layers into circuits, yet the vertical composition between heads is fixed after training by static projection products (*virtual weights*). While attention makes the **horizontal** flow across tokens input-dependent, the **vertical** flow across heads remains static—and recent multi-stream or depth-attention architectures (DenseFormer, HC/mHC, MUDDFormer, AttnRes) only aggregate already-summed layer hidden states rather than individual heads.
 
 We propose **loom attention**, which enables a Transformer to dynamically rewire its head-to-head circuits at every token by interweaving a head's **vertical attention** over the outputs of earlier heads (to construct its query, key, value, and local output bypass) with its **horizontal attention** over tokens. Vertical attention is instantiated efficiently via normalized and gated linear attention over a fixed-size per-token matrix memory $M_t \in \mathbb{R}^{d_k \times d}$, yielding **LoomFormer**, a dual-stream architecture that cleanly separates **control** (vector residual stream $x_t \in \mathbb{R}^D$) and **content** (matrix memory stream $M_t \in \mathbb{R}^{d_k \times d}$).
+
+<p align="center">
+  <img src="assets/loomformer_arch.png" width="95%" alt="LoomFormer Architecture"/>
+</p>
 
 Across model scales and token budgets:
 - **Scaling Efficiency**: LoomFormer matches standard Transformers trained with **$>3\times$ compute** ($3.19\times$ at Large scale) and outperforms recent residual-stream architectures (HC/mHC, MUDDFormer, AttnRes) trained with **$1.7\times\text{--}2.8\times$ compute**.
