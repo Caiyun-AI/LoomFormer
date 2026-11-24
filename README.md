@@ -23,7 +23,7 @@ Transformers solve tasks by composing attention heads across layers into circuit
 We propose **loom attention**, which enables a Transformer to dynamically rewire its head-to-head circuits at every token by interweaving a head's **vertical attention** over the outputs of earlier heads (to construct its query, key, value, and local output bypass) with its **horizontal attention** over tokens. Vertical attention is instantiated efficiently via normalized and gated linear attention over a fixed-size per-token matrix memory $M_t \in \mathbb{R}^{d_k \times d}$, yielding **LoomFormer**, a dual-stream architecture that cleanly separates **control** (vector residual stream $x_t \in \mathbb{R}^D$) and **content** (matrix memory stream $M_t \in \mathbb{R}^{d_k \times d}$).
 
 <p align="center">
-  <img src="assets/loomformer_arch.png" width="95%" alt="LoomFormer Architecture"/>
+  <img src="assets/loomformer_arch.gif" width="95%" alt="LoomFormer Architecture"/>
 </p>
 
 Across model scales and token budgets:
