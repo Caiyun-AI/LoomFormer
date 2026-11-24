@@ -1,0 +1,66 @@
+# LoomPythia-2.8B (2,775,190,944 params; 300B Pile Pretraining, Paper Section 5.2 & Appendix D)
+base_config: "base.yml"
+
+# Backbone & dimensions (D = 32 * 80 = 2560, L = 32, Pythia tokenizer vocab 50304)
+base_emb_dim: 2560
+base_num_query_heads: 32
+base_num_kv_heads: 32
+head_dim: 80
+base_mlp_dim: 7808
+base_num_decoder_layers: 32
+vocab_size: 50304
+tokenizer_type: "huggingface"
+tokenizer_path: "EleutherAI/pythia-2.8b"
+logits_via_embedding: False
+normalization_layer_epsilon: 1.0e-5
+use_qk_norm: True
+enable_dropout: False
+dropout_rate: 0.0
+max_target_length: 2048
+cast_logits_to_fp32: True
+num_vocab_tiling: 4
+
+# LoomPythia hyperparameters
+loom_backbone: "pythia"
+loom_d_k: 64
+loom_d_r: 640
+loom_rope_dim: 20
+loom_ffn_m_dim: 2944
+loom_last_ffn_x_dim: 9984
+loom_embed_write_divisor: 0.0020825863
+loom_write_eps: 1.0e-6
+loom_qk_scale_dim: "qk_dim"
+loom_logits_bf16_dot_fp32_out: True
+loom_pallas: True
+loom_splash: True
+loom_pallas_vmem_mib: 63
+loom_splash_residual_name: "loom_splash_residual"
+
+# Splash Attention & remat
+sa_block_q: 512
+sa_block_kv: 512
+sa_block_kv_compute: 512
+sa_block_q_dkv: 512
+sa_block_kv_dkv: 512
+sa_block_kv_dkv_compute: 512
+sa_use_fused_bwd_kernel: True
+remat_policy: "custom"
+tensors_on_device: ["loom_splash_residual"]
+
+# Optimizer & schedule (v5p-128 = 64 chips, global batch 1024 sequences = 2M tokens/step)
+opt_type: "adam_pax"
+learning_rate: 1.6e-4
+learning_rate_final_fraction: 0.1
+warmup_steps_fraction: 0.01
+adam_b1: 0.9
+adam_b2: 0.95
+adam_eps: 1.0e-8
+adam_weight_decay: 0.1
+adamw_mask: ['.*scale$', '.*bias$', '.*b_rg.*', '.*b_wg$', '.*b_sg$', '.*c_qk$', '.*c_vo$']
+gradient_clipping_threshold: 1.0
+per_device_batch_size: 16.0
+steps: 143000
+learning_rate_schedule_steps: 143000
+checkpoint_period: 1000
+sharding_tolerance: 0.06
+enable_nnx: False

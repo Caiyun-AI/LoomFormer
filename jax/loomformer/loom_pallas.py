@@ -1,0 +1,1215 @@
+"""Fused TPU Pallas kernels for LoomFormer matrix-memory reads and writes.
+
+Carries the matrix stream M in paper/pseudocode token-major order [B, T, d_k, d]
+(where d_k = num_slots on the sublane-aligned axis and d = head_dim on the lane axis).
+All four MReads (q_tilde, k_tilde, v, o_m) of all n heads collapse into one per-token
+(4n x d_k) @ (d_k x d) MXU matrix multiplication in VMEM, fused with MShift, MNorm,
+and port normalization/gating (forward and backward). MWrite similarly fuses port
+normalization/gating and the n-head outer-product sum onto the MXU.
+"""
+import dataclasses
+from functools import partial
+import math
+
+import jax
+from jax.ad_checkpoint import checkpoint_name
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
+import jax.numpy as jnp
+
+F32 = jnp.float32
+
+
+def _norm(x, epsilon, axis):
+  f = x.astype(F32)
+  return f * jax.lax.rsqrt(jnp.mean(f * f, axis=axis, keepdims=True) + epsilon)
+
+
+def _norm_backward(x, cotangent, epsilon, axis):
+  f = x.astype(F32)
+  u = cotangent.astype(F32)
+  inv = jax.lax.rsqrt(jnp.mean(f * f, axis=axis, keepdims=True) + epsilon)
+  return (u - f * (jnp.mean(u * f, axis=axis, keepdims=True) * inv * inv)) * inv
+
+
+def _sigmoid(x):
+  return jax.nn.sigmoid(x.astype(F32))
+
+
+def _spec(shape, tile):
+  return pl.BlockSpec((None,) + tuple(shape) + (tile,), lambda b, i: (b,) + (0,) * len(shape) + (i,))
+
+
+def _whole(shape):
+  return pl.BlockSpec(tuple(shape), lambda b, i, n=len(shape): (0,) * n)
+
+
+def _params(semantics, vmem_mib):
+  kwargs = dict(dimension_semantics=semantics)
+  if vmem_mib:
+    kwargs['vmem_limit_bytes'] = int(vmem_mib) * 1024 * 1024
+  return pltpu.CompilerParams(**kwargs)
+
+
+def _pad_rows(n):
+  return -(-n // 8) * 8
+
+
+def _freeze(d):
+  return tuple(sorted(d.items()))
+
+
+def _map_batch(fn, args, batch_args, n_out):
+  from jax._src import mesh as mesh_lib
+  mesh = mesh_lib.thread_resources.env.physical_mesh
+  if not mesh.axis_names or mesh.size == 1:
+    return fn(*args)
+  from flax import linen as nn
+  from jax.experimental.shard_map import shard_map
+  from jax.sharding import PartitionSpec as P
+  axes = nn.logical_to_mesh_axes(('activation_batch',))[0]
+  names = (axes,) if isinstance(axes, str) else (axes or ())
+  if not names or any(size > 1 and name not in names for name, size in mesh.shape.items()):
+    raise ValueError('Loom Pallas core supports batch/FSDP mesh axes only')
+  spec = P(axes)
+  out_specs = spec if n_out == 1 else (spec,) * n_out
+  return shard_map(fn, mesh=mesh, in_specs=tuple(spec if b else P() for b in batch_args),
+                   out_specs=out_specs, check_rep=False)(*args)
+
+
+def static_weight(static_q, static_k, static_v, static_o, compression):
+  """Stack [V,N] static keys and the [V,C] compression into the [4N+C, V] read weight."""
+  return jnp.concatenate((static_q, static_k, static_v, static_o, compression), axis=1).T
+
+
+def _to_tokens(x):
+  """[K, T] FP32 slab -> [T, K] via one XLU transpose of the 128-row padded slab."""
+  kdim = x.shape[0]
+  if kdim % 128:
+    x = jnp.concatenate((x, jnp.zeros((128 - kdim % 128, x.shape[1]), x.dtype)), axis=0)
+  return x.T[:, :kdim]
+
+
+def _from_tokens(x):
+  """[T, K] slab -> [K, T] (lane-padded to 128 before the XLU transpose)."""
+  kdim = x.shape[1]
+  if kdim % 128:
+    x = jnp.concatenate((x, jnp.zeros((x.shape[0], 128 - kdim % 128), x.dtype)), axis=1)
+  return x.T[:kdim]
+
+
+
+def _bdot(x, y, cx, cy):
+  """Token-batched matmul: contract x axis cx with y axis cy, batch over axis 0."""
+  return jax.lax.dot_general(x, y, (((cx,), (cy,)), ((0,), (0,))), preferred_element_type=F32)
+
+
+def _token_spec(shape, tile):
+  return pl.BlockSpec((None, tile) + tuple(shape), lambda b, i: (b, i) + (0,) * len(shape))
+
+
+# ---------------------------------------------------------------------------
+# v8t: v7's T-minor kernel I/O (keys/gates/factors [.., T] slabs, Splash-native [B,N,T,K] q/k/v/o),
+# token-major M [B,T,V,K], per-token MXU matmuls inside the kernel. The token-major key matrices
+# X_t^T [V, R] are built by one XLU transpose per v of the T-minor [R, T] key slab plus strided
+# VMEM stores; per-token outputs Y_t [R, K] become head-major token rows by strided VMEM loads.
+# Rows r = arm * NP + head (arms q, k, v, o; NP = heads padded to 8); full-M reads (C == V) only.
+
+
+
+class _WholeKeys:
+  """Packed keys read as one [C, S*N, T] block (S*N rows: q, k, v, o or q, k, vo) when N is not a
+  sublane multiple, so per-arm block views are illegal. Stands in for rq, rk and rr: shape is a
+  per-arm view's, rows(c) the four arms' [4N, T] rows (a shared VO slab repeated)."""
+
+  def __init__(self, ref, n):
+    self.ref, self.n = ref, n
+    self.slabs = ref.shape[1] // n
+    self.shape = (ref.shape[0], n, ref.shape[2])
+    self.vo_rows = (self.slabs - 2) * n
+
+  def rows(self, c):
+    x = self.ref[c].astype(F32)
+    return x if self.slabs == 4 else jnp.concatenate((x, x[2 * self.n:]), axis=0)
+
+
+def _vo_rows(rr):
+  return rr.vo_rows if isinstance(rr, _WholeKeys) else rr.shape[1]
+
+
+def _tm_rows(rq, rk, rr, c):
+  """Raw Q/K/V/O rows; rr holds a shared VO key or packed independent V/O keys."""
+  if isinstance(rq, _WholeKeys):
+    return rq.rows(c)
+  if rr.shape[1] == 2 * rq.shape[1]:
+    return jnp.concatenate((rq[c].astype(F32), rk[c].astype(F32), rr[c].astype(F32)), axis=0)
+  return jnp.concatenate([x[c].astype(F32) for x in (rq, rk, rr, rr)], axis=0)
+
+
+def _tm_slabs(eps, scale, rq, lq, rk, lk, rr, lo, lv):
+  """Per-row inverse RMS norms over C and gates, stacked [R, T]; keys stay in their refs."""
+  cdim = rq.shape[0]
+  ss = None
+  for c in range(cdim):
+    x = _tm_rows(rq, rk, rr, c)
+    ss = x * x if ss is None else ss + x * x
+  inv = jax.lax.rsqrt(ss / cdim + eps)
+  g = jnp.concatenate([scale * _sigmoid(l[...]) for l in (lq, lk, lv, lo)], axis=0)
+  return inv, g
+
+
+def _tm_o_mask(om, c, rows):
+  """[R, T] multiplier slab of column c: ones on the Q/K/V rows, the O weight multiplier on the O rows."""
+  np_ = om.shape[1]
+  return jnp.concatenate((jnp.ones((rows - np_, om.shape[2]), F32), om[c].astype(F32)), axis=0)
+
+
+def _tm_split_scale(os_ref, rows, const_rows):
+  """Trailing dynamic-key scale rows os [S,C] split into a per-row [R,1] scale for the leading const_rows
+  (constant over C: folded once into the [R,T] gate) and a per-c [R,C] scale for the rest (ones elsewhere)."""
+  o = os_ref[...].astype(F32)
+  start, cdim = rows - o.shape[0], o.shape[1]
+  ones = lambda n, w: [jnp.ones((n, w), F32)] if n else []
+  per_c = o.shape[0] - const_rows
+  rs = (jnp.concatenate(ones(start, 1) + [o[:const_rows, :1]] + ones(per_c, 1), axis=0)
+        if const_rows else None)
+  osc = jnp.concatenate(ones(rows - per_c, cdim) + [o[const_rows:]], axis=0) if per_c else None
+  return osc, rs
+
+
+def _cpad(cdim, skew=False):
+  """Per-token row stride of token-major [T*C, L] scratches: C rounded up to the f32 sublane tile, so
+  every token's [C, L] matrix starts tile-aligned (unaligned C costs relayouts on every chunk).
+  skew moves strides that are multiples of 32 up by one tile: the per-c strided stores/loads at such
+  strides run ~15% slower on v5p (V32/V64: read F+R -13%/-17% at 40/72; V40 -> 48 is +4%)."""
+  cp = -(-cdim // 8) * 8
+  return cp + 8 if skew and cp % 32 == 0 else cp
+
+
+def _tm_fill_keys(rq, rk, rr, inv, g, st, sg, xt_scr, om=None, osc=None):
+  """xt_scr rows t*CP + c = X_t^T[c] (token-major, CP = _cpad(C)); X^T[c] = g * inv * r[c] + S[:, c] * sg.
+
+  om [C, NP, T]: optional O-row multiplier (address-weight dropout) applied to the whole effective
+  O weight, static plus dynamic, after the key RMS norm.
+  osc [R, C]: optional per-row coordinate scale of the dynamic (normalized, gated) key only:
+  X^T[c] = g * inv * osc[:, c] * r[c] + S[:, c] * sg."""
+  gi = g * inv
+  cdim = rq.shape[0]
+  cp = xt_scr.shape[0] // inv.shape[1]
+  for c in range(cdim):
+    slab = gi * _tm_rows(rq, rk, rr, c)
+    if osc is not None:
+      slab = slab * osc[:, c:c + 1]
+    s_col = st[:, c:c + 1]
+    slab = slab + (s_col * sg if sg is not None else s_col)
+    if om is not None:
+      slab = slab * _tm_o_mask(om, c, slab.shape[0])
+    xt_scr[pl.ds(c, slab.shape[1], stride=cp), :] = _to_tokens(slab)
+
+
+def _put(scr, p, x):
+  """Row block p of a [P*T, L] scratch (contiguous T rows)."""
+  t = x.shape[0]
+  scr[pl.ds(p * t, t), :] = x
+
+
+def _chunk(scr, t0, ch, p):
+  """Token-major [T*P, L] scratch -> [ch, P, L] matrices of tokens t0..t0+ch (contiguous)."""
+  return scr[pl.ds(t0 * p, ch * p), :].reshape(ch, p, scr.shape[1])
+
+
+def _cchunk(scr, t0, ch, cdim, t):
+  """[ch, C, L] matrices of tokens t0..t0+ch from a token-major [T*CP, L] scratch (CP >= C)."""
+  cp = scr.shape[0] // t
+  x = _chunk(scr, t0, ch, cp)
+  return x if cp == cdim else x[:, :cdim]
+
+
+def _gather(scr, t0, ch, t):
+  """[P*T, L] scratch (row p*T + token) -> [ch, P, L] matrices of tokens t0..t0+ch: aligned [ch, L]
+  block loads and one sublane<->major swap in registers (strided per-token loads cost ~1 op per row)."""
+  blk = jnp.stack([scr[pl.ds(q * t + t0, ch), :] for q in range(scr.shape[0] // t)], axis=0)
+  return jnp.swapaxes(blk, 0, 1)
+
+
+def _scatter(scr, t0, x, t):
+  """Inverse of _gather: x [ch, P, L] -> rows p*T + t0.. of a [P*T, L] scratch."""
+  blk = jnp.swapaxes(x, 0, 1)
+  for q in range(blk.shape[0]):
+    scr[pl.ds(q * t + t0, x.shape[0]), :] = blk[q]
+
+
+def _shift_gate(sh_ref, t0, ch, rows):
+  """[ch, C, rows] lane-broadcast previous-token shares g'[c] of tokens t0..t0+ch (zero if invalid)."""
+  cdim = sh_ref.shape[0]
+  return jnp.stack([jnp.broadcast_to(sh_ref[:, pl.ds(t0 + i, 1)].astype(F32), (cdim, rows))
+                    for i in range(ch)], axis=0)
+
+
+def _fill_shift_gate(sh_ref, gb_scr):
+  """gb_scr rows t*C + c = g'[c, t] broadcast over lanes: one XLU transpose + strided store per c."""
+  cdim, t = sh_ref.shape
+  lanes = gb_scr.shape[1]
+  for c in range(cdim):
+    row = jnp.broadcast_to(sh_ref[pl.ds(c, 1), :].astype(F32), (lanes, t))
+    gb_scr[pl.ds(c, t, stride=gb_scr.shape[0] // t), :] = _to_tokens(row)
+
+
+def _prev_from(m_ref, mh_ref, t0, mt):
+  """M_{t-1} of the loaded chunk mt [ch, V, K]: one extra token (halo at the tile start) + mt[:-1]."""
+  first = mh_ref[...][None] if t0 == 0 else m_ref[pl.ds(t0 - 1, 1)]
+  return jnp.concatenate((first.astype(mt.dtype), mt[:-1]), axis=0)
+
+
+def _m_inv_rms(x, eps):
+  """Per-token 1/RMS of whole read matrices x [ch, V, K] (FP32), [ch, 1, 1]: M pre-norm."""
+  ss = jnp.sum(jnp.sum(x * x, axis=2, keepdims=True), axis=1, keepdims=True)
+  return jax.lax.rsqrt(ss / (x.shape[1] * x.shape[2]) + eps)
+
+
+def _m_norm_backward(x, s, g):
+  """Cotangent of x from g = d(x s), s = 1/RMS(x): s g - x s^3 sum(g x) / N per token."""
+  gx = jnp.sum(jnp.sum(g * x, axis=2, keepdims=True), axis=1, keepdims=True)
+  return s * g - x * (s * s * s * gx / (x.shape[1] * x.shape[2]))
+
+
+def _dot2(x, w):
+  """FP32 x @ bf16 0/1 matrix w on the MXU via a bf16 hi/lo split (~1e-5 relative): row sums and
+  per-head selections arrive lane-broadcast, avoiding [T, 1] column reductions and broadcasts."""
+  hi = x.astype(jnp.bfloat16)
+  lo = (x - hi.astype(F32)).astype(jnp.bfloat16)
+  dot = lambda v: jax.lax.dot_general(v, w, (((1,), (0,)), ((), ())), preferred_element_type=F32)
+  return dot(hi) + dot(lo)
+
+
+def _head_selector(np_, qdim, h):
+  """[NP, qdim] bf16 rows: ones in row h, so [T, NP] @ it broadcasts column h over qdim lanes."""
+  rows = jax.lax.broadcasted_iota(jnp.int32, (np_, qdim), 0)
+  return jnp.where(rows == h, 1., 0.).astype(jnp.bfloat16)
+
+
+def _tm_read_kernel(n, qk_cols, eps, scale, q_scale, gated, ch, shifted=False, qdim=None, masked=False,
+                    scaled=False, qk_norm=None, m_norm=None, const_rows=0, whole=False):
+  def kernel(m_ref, st_ref, rq, lq, rk, lk, rr, lo, lv, qs, ks, *refs):
+    if whole:
+      rq = rk = rr = _WholeKeys(rq, n)
+    if gated:
+      sg_ref, refs = refs[0], refs[1:]
+    if shifted:
+      (sh_ref, mh_ref), refs = refs[:2], refs[2:]
+    om = osc = None
+    if masked:
+      om, refs = refs[0], refs[1:]
+    if scaled:
+      os_ref, refs = refs[0], refs[1:]
+    if qk_norm:
+      (ss_ref, mm_ref), refs = refs[:2], refs[2:]
+    q_ref, k_ref, v_ref, o_ref = refs[:4]
+    if qk_norm:
+      (xq_ref, xk_ref, inv_ref), refs = refs[4:7], refs[3:]
+    xt_scr, y_scr = refs[4:6]
+    col_scr = refs[6] if qk_norm else None
+    t, _, kdim = m_ref.shape
+    cdim = rq.shape[0]
+    np_ = rq.shape[1]                 # heads, optionally padded to a multiple of 8 by the wrapper
+    r = 4 * np_
+    dt = m_ref.dtype
+    inv, g = _tm_slabs(eps, scale, rq, lq, rk, lk, rr, lo, lv)
+    sg = sg_ref[...].astype(F32).reshape(r, t) if gated else None
+    if scaled:        # per-head scales constant over C fold into the gate once, not per c
+      osc, rs = _tm_split_scale(os_ref, r, const_rows)
+      g = g if rs is None else g * rs
+    _tm_fill_keys(rq, rk, rr, inv, g, st_ref[...].astype(F32), sg, xt_scr, om, osc)
+    for t0 in range(0, t, ch):
+      if shifted or m_norm is not None:
+        # Y_t = X_t M_read_t, M_read_t = M_t + g'(M_{t-1} - M_t) mixed on the VPU. Per-token gate
+        # broadcasts beat a gate scratch here; the dot form (X_t g') M_{t-1} costs a second matmul.
+        # M pre-norm then scales the mixed FP32 matrix by its own 1/RMS before the model-dtype cast.
+        xt = _cchunk(xt_scr, t0, ch, cdim, t).astype(dt)
+        mt = m_ref[pl.ds(t0, ch)].astype(F32)
+        mr = mt
+        if shifted:
+          mr = mt + _shift_gate(sh_ref, t0, ch, kdim) * (_prev_from(m_ref, mh_ref, t0, mt) - mt)
+        if m_norm is not None:
+          mr = mr * _m_inv_rms(mr, m_norm)
+        y = _bdot(xt, mr.astype(dt), 1, 1)
+      else:
+        xt = _cchunk(xt_scr, t0, ch, cdim, t).astype(dt)
+        y = _bdot(xt, m_ref[pl.ds(t0, ch)], 1, 1)
+      _scatter(y_scr, t0, y, t)     # Y_t [R, K] -> rows r*T + t
+    lane = jax.lax.broadcasted_iota(jnp.int32, (t, kdim), 1)
+    zstd = jnp.zeros((qk_cols, t), F32)
+    for a, ref in enumerate((q_ref, k_ref, v_ref, o_ref)):
+      if a < 2 and qk_norm:
+        # The standard sums of squares as token columns: one small transpose per arm and tile.
+        ss_cols = _to_tokens(ss_ref[a])                                   # [T, NP]
+        ones_loc = jnp.ones((qk_cols, qdim), jnp.bfloat16)
+      for h in range(n):
+        y = y_scr[pl.ds((a * np_ + h) * t, t), :]                        # [T, K] token rows
+        if a < 2 and qk_norm:
+          # Full-head QKNorm in the epilogue, token-major (no per-head XLU transposes): the row
+          # [T, qdim] = read lanes + token-major standard lanes; the statistic adds the unscaled,
+          # unrotated standard sum of squares. Emit u = xhat * m (m carries the norm scales and the
+          # logit scale) for attention, plus xhat and 1/r as reverse residuals.
+          q_eps, width = qk_norm
+          local = y[:, :qk_cols]
+          rs = qs.shape[-1] // np_                                       # standard width
+          row = jnp.concatenate((local, (qs if a == 0 else ks)[:, pl.ds(h * rs, rs)].astype(F32)), axis=1)
+          # Row statistics and the head's standard sum of squares from the MXU, already broadcast over
+          # the qdim lanes ([T, 1] column reductions/broadcasts are the expensive part on the VPU/XLU).
+          iv = jax.lax.rsqrt((_dot2(local * local, ones_loc) + _dot2(ss_cols, _head_selector(np_, qdim, h)))
+                             / width + q_eps)
+          xhat = row * iv
+          (xq_ref if a == 0 else xk_ref)[h] = xhat.astype(xq_ref.dtype)
+          col_scr[:, pl.ds(h, 1)] = iv[:, :1]
+          ref[h] = (xhat * mm_ref[pl.ds(a, 1), :]).astype(ref.dtype)
+          continue
+        if a < 2:     # columns >= qk_cols are the standard (rotated) Q/K coordinates
+          if qdim is not None and qdim > kdim:
+            # Widened Q/K (qk_cols + standard > K): append the standard rows to the first qk_cols
+            # read rows and write [T, qdim] directly, so no relayout or concat happens outside.
+            rows = jnp.concatenate((_from_tokens(y)[:qk_cols], (qs if a == 0 else ks)[h].astype(F32)), axis=0)
+            y = _to_tokens(rows)
+          elif qk_cols < kdim:
+            std = jnp.concatenate((zstd, (qs if a == 0 else ks)[h].astype(F32)), axis=0)
+            y = jnp.where(lane < qk_cols, y, _to_tokens(std))
+          if a == 0 and q_scale != 1.0:
+            y = y * q_scale
+        ref[h] = y.astype(ref.dtype)
+      if a < 2 and qk_norm:
+        if n < np_:
+          col_scr[:, pl.ds(n, np_ - n)] = jnp.ones((t, np_ - n), F32)
+        inv_ref[a] = _from_tokens(col_scr[...])                          # [NP, T]
+  return kernel
+
+
+def _tm_read_backward_kernel(n, qk_cols, eps, scale, q_scale, gated, ch, pass_m, shifted=False, qdim=None,
+                             masked=False, scaled=False, qk_norm=None, packed=False, m_norm=None, const_rows=0,
+                             whole=False, carry=False):
+  def kernel(m_ref, st_ref, rq, lq, rk, lk, rr, lo, lv, qs, ks, *refs):
+    if whole:
+      rq = rk = rr = _WholeKeys(rq, n)
+    if gated:
+      sg_ref, refs = refs[0], refs[1:]
+    if shifted:
+      (sh_ref, mh_ref), refs = refs[:2], refs[2:]
+    om = osc = None
+    if masked:
+      om, refs = refs[0], refs[1:]
+    if scaled:
+      os_ref, refs = refs[0], refs[1:]
+    if qk_norm:
+      (ss_ref, mm_ref), refs = refs[:2], refs[2:]
+    (dq, dk, dv, do), refs = refs[:4], refs[4:]
+    if pass_m:
+      gp_ref, refs = refs[0], refs[1:]
+    if qk_norm:
+      (xq_ref, xk_ref, inv_ref), refs = refs[:3], refs[3:]
+    if packed:        # one [C, S*N, tile] key cotangent block (q, k, [v,] o rows), written once per c
+      (dm_ref, dst_ref, drq, dlq, dlk, dlo, dlv, dqs, dks), refs = refs[:9], refs[9:]
+      drk = drr = None
+    else:
+      (dm_ref, dst_ref, drq, dlq, drk, dlk, drr, dlo, dlv, dqs, dks), refs = refs[:11], refs[11:]
+    if gated:
+      dsg_ref, refs = refs[0], refs[1:]
+    if shifted and carry:
+      dsh_ref, refs = refs[0], refs[1:]
+    elif shifted:
+      (dsh_ref, bnd_ref), refs = refs[:2], refs[2:]
+    if scaled:
+      dos_ref, refs = refs[0], refs[1:]
+    if qk_norm:
+      (dss_ref, dmm_ref), refs = refs[:2], refs[2:]
+      dmm = [jnp.zeros((1, qdim), F32), jnp.zeros((1, qdim), F32)]
+    xt_scr, dy_scr, dxt_scr, dkey_scr = refs[:4]
+    gb_scr = refs[4] if shifted else None
+    carry_scr = refs[5] if carry else None
+    xm_scr = refs[(5 + int(carry)) if shifted else 4] if masked else None
+    dos_scr = refs[-1] if scaled else None
+    t, _, kdim = m_ref.shape
+    cdim = rq.shape[0]
+    np_ = rq.shape[1]                 # heads, optionally padded to a multiple of 8 by the wrapper
+    r = 4 * np_
+    dt = m_ref.dtype
+    inv, g = _tm_slabs(eps, scale, rq, lq, rk, lk, rr, lo, lv)
+    st = st_ref[...].astype(F32)
+    sg = sg_ref[...].astype(F32).reshape(r, t) if gated else None
+    rs = None
+    if scaled:
+      osc, rs = _tm_split_scale(os_ref, r, const_rows)
+    g_key = g if rs is None else g * rs      # effective gate of the dynamic key
+    _tm_fill_keys(rq, rk, rr, inv, g_key, st, sg, xt_scr, om, osc)
+    if masked:        # token-major O multiplier rows t*C + c, so the per-token dX picks it up
+      for c in range(cdim):
+        xm_scr[pl.ds(c, t, stride=xm_scr.shape[0] // t), :] = _to_tokens(_tm_o_mask(om, c, r))
+    # Token-major cotangent rows dY_t [R, K]; the standard Q/K columns leave the matmuls.
+    lane = jax.lax.broadcasted_iota(jnp.int32, (t, kdim), 1)
+    zrow = jnp.zeros((t, kdim), F32)
+    for a, ref in enumerate((dq, dk, dv, do)):
+      if a < 2 and qk_norm:
+        inv_cols = _to_tokens(inv_ref[a])                                  # [T, NP]
+        std_parts = []
+        # One reduction matrix per head: lanes [0, NP) select column h (column-form s for d ss_std,
+        # accumulated over heads, so no per-head [T, 1] stores); lanes [128, 128+qdim) broadcast s.
+        r_ = jax.lax.broadcasted_iota(jnp.int32, (qdim, 128 + qdim), 1)
+        s_cols = jnp.zeros((t, np_), F32)
+      for h in range(np_):
+        rows = a * np_ + h
+        if h >= n:
+          _put(dy_scr, rows, zrow)
+          if a < 2 and qk_norm:
+            std_parts.append(jnp.zeros((t, qs.shape[-1] // np_), F32))
+          continue
+        y = ref[h].astype(F32)
+        if a < 2 and qk_norm:
+          # Reverse of u = xhat * m, xhat = x / r, r^2 = (|x_local|^2 + ss_std) / W + eps, token-major.
+          # The rotated, scaled standard lanes enter r only through ss_std, so they keep the direct term:
+          # dx_local = (m g - xhat mean(m g xhat)) / r;  dx_std = m g / r;
+          # d ss_std = -mean(m g xhat) / (2 r^2);  dm = sum_t g xhat.
+          q_eps, width = qk_norm
+          xhat = (xq_ref if a == 0 else xk_ref)[h].astype(F32)                  # [T, qdim]
+          gm = y * mm_ref[pl.ds(a, 1), :]
+          iv = _dot2(inv_cols, _head_selector(np_, qdim, h))                    # lane-broadcast 1/r
+          red = _dot2(gm * xhat, jnp.where((r_ == h) | (r_ >= 128), 1., 0.).astype(jnp.bfloat16)) / width
+          s_cols = s_cols + red[:, :np_]
+          s_ = red[:, 128:]
+          local = (iv * (gm - xhat * s_))[:, :qk_cols]
+          std_parts.append((iv * gm)[:, qk_cols:])                               # token-major [T, Rs]
+          dmm[a] = dmm[a] + jnp.sum(y * xhat, axis=0, keepdims=True)
+          if qk_cols < kdim:
+            local = jnp.concatenate((local, jnp.zeros((t, kdim - qk_cols), F32)), axis=1)
+          _put(dy_scr, rows, local)
+          continue
+        if a == 0 and q_scale != 1.0:
+          y = y * q_scale
+        if a < 2:
+          ds = dqs if a == 0 else dks
+          if qdim is not None and qdim > kdim:     # widened [T, qdim] cotangent
+            ys = _from_tokens(y)
+            ds[h] = ys[qk_cols:].astype(ds.dtype)
+            local = ys[:qk_cols]
+            if qk_cols < kdim:
+              local = jnp.concatenate((local, jnp.zeros((kdim - qk_cols, local.shape[1]), F32)), axis=0)
+            y = _to_tokens(local)
+          else:
+            ds[h] = (_from_tokens(y)[qk_cols:].astype(ds.dtype) if qk_cols < kdim
+                     else jnp.zeros(ds.shape[1:], ds.dtype))
+            y = jnp.where(lane < qk_cols, y, 0.)
+        _put(dy_scr, rows, y)
+      if a < 2 and qk_norm:   # d ss_std = -mean(m g xhat) / (2 r^2), all heads at once in column form
+        dss_ref[a] = _from_tokens(-.5 * inv_cols * inv_cols * s_cols)          # [NP, T]
+        ds = dqs if a == 0 else dks
+        ds[...] = jnp.concatenate(std_parts, axis=1).astype(ds.dtype)    # [T, NP*Rs]
+    # Per-token matmuls: dX_t^T = M_t dY_t^T, dM_t = X_t^T dY_t; dS = sum_t sg * dX^T.
+    sgt = _to_tokens(sg) if gated else None                                # [T, R]
+    dst = jnp.zeros((cdim, r), F32)
+    if shifted:
+      _fill_shift_gate(sh_ref, gb_scr)
+    nxt = None        # shifted: dM_{t-1} share of the first token of the chunk after this one
+    if carry:         # tiles run last to first; the share crosses into this tile's last token
+      @pl.when(pl.program_id(1) == 0)
+      def _():
+        carry_scr[...] = jnp.zeros(carry_scr.shape, F32)
+      nxt = carry_scr[...]
+    for t0 in (range(0, t, ch)[::-1] if shifted else range(0, t, ch)):
+      dy = _gather(dy_scr, t0, ch, t).astype(dt)
+      if shifted:
+        # dX = M_read dY^T, dM_read = X^T dY; dM_t = (1-g'_t) dM_read_t + g'_{t+1} dM_read_{t+1};
+        # dg' = sum_k dM_read (M_{t-1} - M_t), reduced over K in registers and stored at lane t.
+        # The gate comes from a per-tile scratch (used twice per token); chunks run backwards so
+        # g'_{t+1} dM_read_{t+1} carries into the chunk before.
+        xt = _cchunk(xt_scr, t0, ch, cdim, t).astype(dt)
+        mt = m_ref[pl.ds(t0, ch)].astype(F32)
+        d = _prev_from(m_ref, mh_ref, t0, mt) - mt
+        gk = _cchunk(gb_scr, t0, ch, cdim, t)
+        mr = mt + gk * d
+        if m_norm is not None:     # dM_read through the per-token pre-norm of the mixed matrix
+          s = _m_inv_rms(mr, m_norm)
+          dxt = _bdot((mr * s).astype(dt), dy, 2, 2)                      # [ch, C, R]
+          dmr = _m_norm_backward(mr, s, _bdot(xt, dy, 2, 1))              # [ch, C, K]
+        else:
+          dxt = _bdot(mr.astype(dt), dy, 2, 2)                            # [ch, C, R]
+          dmr = _bdot(xt, dy, 2, 1)                                       # [ch, C, K]
+        col = jnp.sum(dmr * d, axis=-1, keepdims=True)
+        for i in range(ch):
+          dsh_ref[:, pl.ds(t0 + i, 1)] = col[i].astype(dsh_ref.dtype)
+        e = gk * dmr
+        tail = jnp.zeros_like(e[:1]) if nxt is None else nxt
+        dmv = dmr - e + jnp.concatenate((e[1:], tail), axis=0)
+        nxt = e[:1]
+      elif m_norm is not None:
+        xt = _cchunk(xt_scr, t0, ch, cdim, t).astype(dt)
+        mt = m_ref[pl.ds(t0, ch)].astype(F32)
+        s = _m_inv_rms(mt, m_norm)
+        dxt = _bdot((mt * s).astype(dt), dy, 2, 2)                        # [ch, C, R]
+        dmv = _m_norm_backward(mt, s, _bdot(xt, dy, 2, 1))                # [ch, C, K]
+      else:
+        xt = _cchunk(xt_scr, t0, ch, cdim, t).astype(dt)
+        dxt = _bdot(m_ref[pl.ds(t0, ch)], dy, 2, 2)                       # [ch, C, R]
+        dmv = _bdot(xt, dy, 2, 1)                                         # [ch, C, K]
+      if masked:      # d(pre-multiplier X) = multiplier * dX: static weight, gates and keys all see it
+        dxt = dxt * _cchunk(xm_scr, t0, ch, cdim, t)
+      cp = dxt_scr.shape[0] // t
+      dxt_rows = dxt if cp == cdim else jnp.concatenate((dxt, jnp.zeros((ch, cp - cdim, r), F32)), axis=1)
+      dxt_scr[pl.ds(t0 * cp, ch * cp), :] = dxt_rows.reshape(ch * cp, r)
+      dst = dst + jnp.sum(dxt * sgt[t0:t0 + ch][:, None, :] if gated else dxt, axis=0)
+      if pass_m:
+        dmv = dmv + gp_ref[pl.ds(t0, ch)].astype(F32)
+      dm_ref[pl.ds(t0, ch)] = dmv.astype(dm_ref.dtype)
+    dst_ref[...] = dst
+    if carry:
+      carry_scr[...] = nxt
+    elif shifted:
+      bnd_ref[...] = nxt[0]
+    # T-minor key reverse: X^T[c] = g * inv * r[c] + S[:, c] * sg; u = d(normalized key) per arm.
+    gacc = jnp.zeros((r, t), F32)      # sum_c dX * r   (gate gradient before * inv)
+    sacc = jnp.zeros((r, t), F32)
+    independent_vo = _vo_rows(rr) == 2 * np_
+    key_rows = (4 if independent_vo else 3) * np_
+    uacc = jnp.zeros((key_rows, t), F32)  # sum_c u * r (RMS-norm reverse)
+    gq, gk, gv, go = (g_key[i * np_:(i + 1) * np_] for i in range(4))
+    scaled_rows = os_ref.shape[0] if scaled else 0
+    scale_start = r - scaled_rows
+    # Leading scale rows constant over c (per-head scalars, e.g. common Q/K and V/O layer scales) need
+    # no per-c work: their gate, key and scale gradients all follow from gacc after the loop.
+    per_c_rows = scaled_rows - const_rows
+    per_start = r - per_c_rows
+    gi_per = (g * inv)[per_start:] if per_c_rows else None
+    for c in range(cdim):
+      dx = _from_tokens(dxt_scr[pl.ds(c, t, stride=dxt_scr.shape[0] // t), :])     # [R, T]
+      rows = _tm_rows(rq, rk, rr, c)
+      if gated:
+        sacc = sacc + dx * st[:, c:c + 1]
+      if per_c_rows:  # d gamma = sum_t dX * g inv r, for per-coordinate scales.
+        dx_scaled = dx[per_start:]
+        dos_scr[pl.ds(c * per_c_rows, per_c_rows), :] = dx_scaled * rows[per_start:] * gi_per
+        dx = (jnp.concatenate((dx[:per_start], dx_scaled * osc[per_start:, c:c + 1]), axis=0)
+              if per_start else dx_scaled * osc[:, c:c + 1])
+      gacc = gacc + dx * rows
+      vo_u = ((gv * dx[2 * np_:3 * np_], go * dx[3 * np_:4 * np_]) if independent_vo else
+              (gv * dx[2 * np_:3 * np_] + go * dx[3 * np_:4 * np_],))
+      u = jnp.concatenate((gq * dx[0:np_], gk * dx[np_:2 * np_]) + vo_u, axis=0)
+      dkey_scr[c] = u
+      uacc = uacc + u * rows[:key_rows]
+    gacc = gacc * inv
+    if const_rows:    # d s = sum_c dX g inv r for per-head scales; the gate gradient then carries s
+      cacc = (gacc * g)[scale_start:scale_start + const_rows]
+      gacc = gacc * rs
+    sig = lambda l: _sigmoid(l[...]) * (1 - _sigmoid(l[...]))
+    for i, (l, dl) in enumerate(((lq, dlq), (lk, dlk), (lv, dlv), (lo, dlo))):
+      dl[...] = (scale * sig(l) * gacc[i * np_:(i + 1) * np_]).astype(dl.dtype)
+    key_inv = inv[:key_rows]
+    coef = uacc / cdim * key_inv * key_inv
+    for c in range(cdim):     # d r[c] = (u[c] - r[c] * mean_c(u r) inv^2) inv
+      dr = (dkey_scr[c] - _tm_rows(rq, rk, rr, c)[:key_rows] * coef) * key_inv
+      if packed:
+        drq[c] = dr.astype(drq.dtype)
+      else:
+        for i, ref in enumerate((drq, drk)):
+          ref[c] = dr[i * np_:(i + 1) * np_].astype(ref.dtype)
+        drr[c] = dr[2 * np_:].astype(drr.dtype)
+    if gated:
+      dsg_ref[...] = sacc.reshape(4, np_, t).astype(dsg_ref.dtype)
+    if qk_norm:
+      dmm_ref[...] = jnp.concatenate(dmm, axis=0)
+    if scaled:        # token sums of all C*NP rows as one lane-dense MXU row (no per-c XLU reduce)
+      tsum = lambda x: jax.lax.dot_general(
+          jnp.ones((8, t), F32), x, (((1,), (1,)), ((), ())),
+          precision=jax.lax.Precision.HIGHEST, preferred_element_type=F32)[:1]
+      parts = (([tsum(dos_scr[...])] if per_c_rows else []) + ([tsum(cacc)] if const_rows else []))
+      dos_ref[...] = jnp.concatenate(parts, axis=1) if len(parts) > 1 else parts[0]
+  return kernel
+
+
+def _std_tok_spec(shape, tile):
+  """Token-major standard Q/K [B,T,NP*Rs] (fused QKNorm): lane-dense [tile, NP*Rs] blocks."""
+  return pl.BlockSpec((None, tile, shape[2]), lambda bb, i: (bb, i, 0))
+
+
+def _tm_read_specs(args, tile, packed=False, std_tok=False):
+  m, st = args[0], args[1]
+  specs = [_token_spec(m.shape[2:], tile), _whole(st.shape)] + [_spec(x.shape[1:-1], tile) for x in args[2:]]
+  if std_tok:
+    specs[9], specs[10] = _std_tok_spec(args[9].shape, tile), _std_tok_spec(args[10].shape, tile)
+  if packed:          # one key array read as Q, K and the V/O slab: [B,C,4N,T] (q,k,v,o) or [B,C,3N,T] (q,k,vo)
+    cdim, slabs = args[2].shape[1], int(packed)
+    np_ = args[2].shape[2] // slabs
+    block = lambda rows, idx: pl.BlockSpec((None, cdim, rows, tile), lambda bb, i: (bb, 0, idx, i))
+    if _whole_keys(np_, packed):
+      # Per-arm views need N % 8 == 0: read all S*N rows as one block; the K and V/O views stay in
+      # HBM untouched (no DMA).
+      specs[2], specs[4], specs[6] = block(slabs * np_, 0), _hbm(), _hbm()
+    else:
+      specs[2], specs[4] = block(np_, 0), block(np_, 1)
+      specs[6] = block(2 * np_, 1) if slabs == 4 else block(np_, 2)
+  return specs
+
+
+def _whole_keys(n, packed):
+  return bool(packed) and n % 8 != 0
+
+
+def _hbm():
+  return pl.BlockSpec(memory_space=pltpu.ANY)
+
+
+def _key_shapes(args, packed):
+  """(rq, rk, rr) shapes as the kernel sees them; packed = key slabs (4: q,k,v,o; 3: q,k,vo; 0: none)."""
+  if not packed:
+    return args[2].shape, args[4].shape, args[6].shape
+  b, cdim, rows, t = args[2].shape
+  n = rows // int(packed)
+  return (b, cdim, n, t), (b, cdim, n, t), (b, cdim, rows - 2 * n, t)
+
+
+def _halo_spec(m, tile):
+  """The token before each tile (clamped to token 0 for the first tile) as one [V, K] block."""
+  return pl.BlockSpec((None, None) + m.shape[2:], lambda bb, i: (bb, jnp.maximum(i * tile - 1, 0), 0, 0))
+
+
+def _shift_specs(m, sh, tile):
+  return [_spec(sh.shape[1:-1], tile), _halo_spec(m, tile)] if sh is not None else []
+
+
+def _tm_out_spec(n, tile, kdim):
+  return pl.BlockSpec((None, n, tile, kdim), lambda bb, i: (bb, 0, i, 0))
+
+
+def _qk_norm_specs(qn, tile):
+  return [] if qn is None else [_spec(qn[0].shape[1:-1], tile), _whole(qn[1].shape)]
+
+
+def _tm_read_forward_call(args, opts, sh=None, om=None, os=None, qn=None):
+  m = args[0]
+  b, t, vdim, kdim = m.shape
+  packed = int(opts.get('packed') or 0)        # key slabs: 4, 3 or 0 (unpacked)
+  cdim = args[2].shape[1]
+  n = opts['heads']
+  r = 4 * _key_shapes(args, packed)[0][2]
+  tile = min(opts['tile'], t)
+  qdim = opts.get('qdim') or kdim
+  qk_out = jax.ShapeDtypeStruct((b, n, t, qdim), m.dtype)
+  out = jax.ShapeDtypeStruct((b, n, t, kdim), m.dtype)
+  qk_norm = opts.get('qk_norm')
+  out_specs = [_tm_out_spec(n, tile, qdim)] * 2 + [_tm_out_spec(n, tile, kdim)] * 2
+  out_shape = (qk_out,) * 2 + (out,) * 2
+  if qk_norm:         # residuals: xhat for Q/K and 1/r [B,2,NP,T]
+    out_specs += [_tm_out_spec(n, tile, qdim)] * 2 + [_spec(qn[0].shape[1:-1], tile)]
+    out_shape += (qk_out,) * 2 + (jax.ShapeDtypeStruct(qn[0].shape, F32),)
+  in_specs = (_tm_read_specs(args, tile, packed, bool(qk_norm)) + _shift_specs(m, sh, tile)
+              + _mask_specs(om, tile) + _scale_specs(os) + _qk_norm_specs(qn, tile))
+  inputs = (*args, *(() if sh is None else (sh, m)), *(() if om is None else (om,)),
+            *(() if os is None else (os,)), *(() if qn is None else qn))
+  scratch = lambda cp: ([pltpu.VMEM((cp * tile, r), F32), pltpu.VMEM((tile * r, kdim), F32)]
+                        + ([pltpu.VMEM((tile, r // 4), F32)] if qk_norm else []))
+  vmem = lambda cp: (_vmem_bytes(in_specs, inputs, []) + _vmem_bytes(out_specs, out_shape, scratch(cp)))
+  return pl.pallas_call(
+      _tm_read_kernel(n, opts['qk_cols'], opts['read_epsilon'], opts['key_scale'], opts['q_scale'],
+                      len(args) == 12, opts['chunk'], sh is not None, qdim, om is not None, os is not None,
+                      qk_norm, opts.get('m_norm'), int(opts.get('scale_const_rows') or 0),
+                      _whole_keys(n, packed)),
+      grid=(b, t // tile),
+      in_specs=in_specs,
+      out_specs=out_specs,
+      out_shape=out_shape,
+      scratch_shapes=scratch(_stride(cdim, opts, vmem)),
+      interpret=opts['interpret'], compiler_params=_params(('parallel', 'parallel'), opts['vmem_mib']),
+      name='loom_core_read')(*inputs)
+
+
+def _vmem_bytes(specs, arrays, scratch):
+  """Scoped-VMEM estimate of a pallas_call: pipelined blocks (x buffer count) plus scratch."""
+  total = 0
+  for spec, x in zip(specs, arrays):
+    if spec.block_shape is None:     # whole array in HBM (memory_space=ANY)
+      continue
+    bufs = spec.pipeline_mode.buffer_count if spec.pipeline_mode is not None else 2
+    total += math.prod(b if isinstance(b, int) else 1 for b in spec.block_shape) * x.dtype.itemsize * bufs
+  return total + sum(math.prod(s.shape) * jnp.dtype(s.dtype).itemsize for s in scratch)
+
+
+# Mosaic's scoped VMEM exceeds the block+scratch estimate by its own temporaries: the 2.8B fused-QKNorm
+# read reverse (B16 T2048 N32 K80 V64) estimates 44.1 MiB and needs 62.6 MiB.
+VMEM_OVERHEAD = 1.45
+
+
+def _stride(cdim, opts, vmem_with):
+  """Scratch row stride: skewed per _cpad when stride_skew is True, or for 'auto' when the skewed
+  call's VMEM estimate vmem_with(cp) times VMEM_OVERHEAD fits under the limit."""
+  mode, cp, skewed = opts.get('stride_skew'), _cpad(cdim), _cpad(cdim, True)
+  if not mode or skewed == cp:
+    return cp
+  if mode is True:
+    return skewed
+  limit = int(opts['vmem_mib'] or 16) * 2 ** 20
+  return skewed if vmem_with(skewed) * VMEM_OVERHEAD <= limit else cp
+
+
+def _reverse_tiles(spec, nt):
+  """The same block spec visiting token tiles last to first (grid index i -> tile nt - 1 - i)."""
+  if getattr(spec, 'index_map', None) is None:
+    return spec
+  f = spec.index_map
+  return dataclasses.replace(spec, index_map=lambda bb, i: f(bb, nt - 1 - i))
+
+
+def _add_tile_boundary_gradients(dm, boundary, tile):
+  """Accumulate previous-tile cotangents without an XLA strided gather.
+
+  The gather/scatter form can exhaust scoped VMEM on v5p for K61 despite
+  small logical tensors. Static slices and concatenation keep the same FP32
+  addition/cast at each boundary and leave the final tile untouched.
+  """
+  b, t, v, k = dm.shape
+  if t <= tile:
+    return dm
+  tiles = dm.reshape(b, t // tile, tile, v, k)
+  prefix = tiles[:, :-1]
+  carry = jax.lax.slice_in_dim(boundary, 1, boundary.shape[1], axis=1)
+  last = (prefix[:, :, -1:].astype(F32) + jnp.expand_dims(carry, 2)).astype(dm.dtype)
+  prefix = jnp.concatenate((prefix[:, :, :-1], last), axis=2)
+  return jnp.concatenate((prefix, tiles[:, -1:]), axis=1).reshape(dm.shape)
+
+
+def _tm_read_backward_call(args, cts, opts, sh=None, om=None, os=None, qn=None, qn_res=()):
+  m, st = args[0], args[1]
+  b, t, vdim, kdim = m.shape
+  packed = int(opts.get('packed') or 0)        # key slabs: 4, 3 or 0 (unpacked)
+  key_shapes = _key_shapes(args, packed)
+  cdim, np_ = key_shapes[0][1:3]
+  n = opts['heads']
+  r = 4 * np_
+  tile = min(opts['reverse_tile'], t)
+  pass_m = len(cts) == 5
+  gated = len(args) == 12
+  shifted = sh is not None
+  extra = ((() if sh is None else (sh, m)) + (() if om is None else (om,)) + (() if os is None else (os,))
+           + (() if qn is None else tuple(qn)))
+  qdim = opts.get('qdim') or kdim
+  qk_norm = opts.get('qk_norm')
+  in_specs = (_tm_read_specs(args, tile, packed, bool(qk_norm)) + _shift_specs(m, sh, tile) + _mask_specs(om, tile)
+              + _scale_specs(os)
+              + _qk_norm_specs(qn, tile)
+              + [_tm_out_spec(n, tile, qdim)] * 2 + [_tm_out_spec(n, tile, kdim)] * 2
+              + [_token_spec((vdim, kdim), tile)] * pass_m
+              # xhat residuals single-buffered by default: the reverse already sits at the v5p VMEM
+              # limit, and their DMA is small next to the per-token matmuls. v6e can double-buffer.
+              + ([pl.BlockSpec((None, n, tile, qdim), lambda bb, i: (bb, 0, i, 0),
+                               **({} if opts.get('xhat_double_buffer') else {'pipeline_mode': pl.Buffered(1)}))] * 2
+                 + [_spec(qn[0].shape[1:-1], tile)] if qk_norm else []))
+  # Packed keys: the full [B,C,4N,T] cotangent is one output; the K and V/O views get none.
+  grad_args = [x for i, x in enumerate(args[2:]) if not (packed and i in (2, 4))]
+  out_specs = ([_token_spec((vdim, kdim), tile), pl.BlockSpec((None, None, cdim, r), lambda bb, i: (bb, i, 0, 0))]
+               + [_spec(x.shape[1:-1], tile) for x in grad_args])
+  if qk_norm:         # token-major standard Q/K cotangents (shifted by the two dropped views when packed)
+    q_at = 2 + (5 if packed else 7)
+    out_specs[q_at], out_specs[q_at + 1] = _std_tok_spec(args[9].shape, tile), _std_tok_spec(args[10].shape, tile)
+  out_shape = ([jax.ShapeDtypeStruct(m.shape, m.dtype), jax.ShapeDtypeStruct((b, t // tile, cdim, r), F32)]
+               + [jax.ShapeDtypeStruct(x.shape, x.dtype) for x in grad_args])
+  # 'auto': carry when the local batch still splits across megacore TensorCores (the tile axis turns
+  # sequential, leaving the batch axis as the only parallel grid axis).
+  mode = opts.get('shift_carry')
+  carry = shifted and (mode is True or (mode == 'auto' and b >= 2))
+  if shifted:
+    out_specs += [_spec(sh.shape[1:-1], tile)]
+    out_shape += [jax.ShapeDtypeStruct(sh.shape, sh.dtype)]
+    if not carry:     # per-tile first-token shares, added to the previous tile in XLA
+      out_specs += [pl.BlockSpec((None, None, vdim, kdim), lambda bb, i: (bb, i, 0, 0))]
+      out_shape += [jax.ShapeDtypeStruct((b, t // tile, vdim, kdim), F32)]
+  scaled_rows = os.shape[0] if os is not None else 0
+  const_rows = int(opts.get('scale_const_rows') or 0)
+  per_c_rows = scaled_rows - const_rows
+  dos_width = cdim * per_c_rows + const_rows
+  if os is not None:  # per-tile partial scale gradients [1, C*per-c rows (c-major) + constant rows].
+    out_specs += [pl.BlockSpec((None, None, 1, dos_width), lambda bb, i: (bb, i, 0, 0))]
+    out_shape += [jax.ShapeDtypeStruct((b, t // tile, 1, dos_width), F32)]
+  if qk_norm:         # d ss_std [B,2,NP,T] and per-tile partial dm [2, qdim]
+    out_specs += [_spec(qn[0].shape[1:-1], tile),
+                  pl.BlockSpec((None, None, 2, qdim), lambda bb, i: (bb, i, 0, 0))]
+    out_shape += [jax.ShapeDtypeStruct(qn[0].shape, F32), jax.ShapeDtypeStruct((b, t // tile, 2, qdim), F32)]
+  def scratch(cp):
+    s = [pltpu.VMEM((cp * tile, r), F32), pltpu.VMEM((r * tile, kdim), F32), pltpu.VMEM((tile * cp, r), F32),
+         pltpu.VMEM((cdim, 2 * np_ + key_shapes[2][2], tile), F32)]
+    if shifted:
+      s += [pltpu.VMEM((tile * cp, kdim), F32)]       # gate g'[c, t] broadcast over lanes
+    if carry:
+      s += [pltpu.VMEM((1, vdim, kdim), F32)]         # share carried to the previous tile
+    if om is not None:
+      s += [pltpu.VMEM((tile * cp, r), F32)]          # token-major O multiplier rows
+    if per_c_rows:
+      s += [pltpu.VMEM((cdim * per_c_rows, tile), F32)]   # per-c scale gradient terms, T-minor
+    return s
+  inputs = (*args, *extra, *cts, *qn_res)
+  vmem = lambda cp: _vmem_bytes(in_specs, inputs, []) + _vmem_bytes(out_specs, out_shape, scratch(cp))
+  scratch_shapes = scratch(_stride(cdim, opts, vmem))
+  if carry:
+    in_specs = [_reverse_tiles(s, t // tile) for s in in_specs]
+    out_specs = [_reverse_tiles(s, t // tile) for s in out_specs]
+  outs = pl.pallas_call(
+      _tm_read_backward_kernel(n, opts['qk_cols'], opts['read_epsilon'], opts['key_scale'], opts['q_scale'],
+                               gated, opts['chunk'], pass_m, shifted, qdim, om is not None, os is not None,
+                               qk_norm, packed, opts.get('m_norm'), const_rows, _whole_keys(n, packed), carry),
+      grid=(b, t // tile), in_specs=in_specs, out_specs=out_specs, out_shape=tuple(out_shape),
+      scratch_shapes=scratch_shapes,
+      input_output_aliases={len(args) + len(extra) + 4: 0} if pass_m else {},
+      interpret=opts['interpret'],
+      compiler_params=_params(('parallel', 'arbitrary' if carry else 'parallel'), opts['vmem_mib']),
+      name='loom_core_read_backward')(*inputs)
+  dqn = None
+  if qk_norm:
+    outs, (dss, dmm) = outs[:-2], outs[-2:]
+    dqn = (dss.astype(qn[0].dtype), jnp.sum(dmm, axis=(0, 1)).astype(qn[1].dtype))
+  dos = None
+  if os is not None:
+    outs, tot = outs[:-1], jnp.sum(outs[-1], axis=(0, 1, 2))
+    # Constant rows carry their c-summed gradient in column 0 (exact under the caller's broadcast).
+    dconst = jnp.zeros((const_rows, cdim), F32).at[:, 0].set(tot[cdim * per_c_rows:])
+    dos = jnp.concatenate((dconst, tot[:cdim * per_c_rows].reshape(cdim, per_c_rows).T), axis=0).astype(os.dtype)
+  dm = outs[0]
+  dsh = None
+  if carry:
+    outs, dsh = outs[:-1], outs[-1]
+  elif shifted:
+    outs, (dsh, bnd) = outs[:-2], outs[-2:]
+    # Each tile's first-token M_{t-1} cotangent belongs to the previous tile's last token.
+    dm = _add_tile_boundary_gradients(dm, bnd, tile)
+  grads = list(outs[2:])
+  if packed:          # the K and V/O views alias the one key array: zero (None) cotangents there
+    grads = grads[:2] + [None] + grads[2:3] + [None] + grads[3:]
+  return (dm, jnp.sum(outs[1], axis=(0, 1)).T.astype(st.dtype)) + tuple(grads), dsh, dos, dqn
+
+
+def _mask_specs(om, tile):
+  return [] if om is None else [_spec(om.shape[1:-1], tile)]
+
+
+def _scale_specs(os):
+  return [] if os is None else [_whole(os.shape)]
+
+
+def _tm_args(m, st, rq, lq, rk, lk, rr, lo, lv, qs, ks, sg):
+  return (m, st, rq, lq, rk, lk, rr, lo, lv, qs, ks) + (() if sg is None else (sg,))
+
+
+@partial(jax.custom_vjp, nondiff_argnums=(16,))
+def _tm_read(m, st, rq, lq, rk, lk, rr, lo, lv, qs, ks, sg, sh, om, os, qn, opts):
+  outs = _tm_read_forward_call(_tm_args(m, st, rq, lq, rk, lk, rr, lo, lv, qs, ks, sg), dict(opts), sh, om, os, qn)
+  return outs[:4] + (m,)
+
+
+def _tm_read_fwd(m, st, rq, lq, rk, lk, rr, lo, lv, qs, ks, sg, sh, om, os, qn, opts):
+  args = _tm_args(m, st, rq, lq, rk, lk, rr, lo, lv, qs, ks, sg)
+  outs = _tm_read_forward_call(args, dict(opts), sh, om, os, qn)
+  return outs[:4] + (m,), (args, sh, om, os, qn, outs[4:])
+
+
+def _tm_read_bwd(opts, res, cts):
+  args, sh, om, os, qn, qn_res = res
+  grads, dsh, dos, dqn = _tm_read_backward_call(args, cts, dict(opts), sh, om, os, qn, qn_res)
+  # The O multiplier is a sampled constant (dropout mask): zero cotangent.
+  return ((grads if len(args) == 12 else grads + (None,)) + (dsh,)
+          + (None if om is None else jnp.zeros_like(om),) + (dos, dqn))
+
+
+_tm_read.defvjp(_tm_read_fwd, _tm_read_bwd)
+
+
+def read_tm(m, static_weight, q_key, q_logits, k_key, k_logits, vo_key, o_logits, v_logits, q_standard,
+            k_standard, *, qk_cols, read_epsilon, key_scale, forward_tile=128, reverse_tile=128,
+            vmem_mib=None, interpret=False, q_scale=1.0, static_gates=None, chunk=8, pad_heads=False,
+            shift=None, o_weight_multiplier=None, o_dynamic_scale=None, v_dynamic_scale=None, qk_norm=None,
+            q_dynamic_scale=None, k_dynamic_scale=None,
+            keys_cnt=None, m_norm=None, xhat_double_buffer=False, shift_carry=False, stride_skew=False, **_):
+  """v7.read's interface (keys [B,T,N,C], logits [B,T,N], standard QK [B,T,N,Rs]) for M [B,T,V,K] and
+  full-M reads (C == V, identity compression). Returns (query, key, value, local_o) [B,T,N,K] and M.
+
+  vo_key may instead be [B,T,2N,V], packing independent V then O keys. The read
+  matmul still has4N rows; the reverse keeps the two address cotangents separate.
+
+  shift [B,T,V]: optional previous-token share g' (zero at invalid tokens); every read then sees
+  M_t + g'_t (M_{t-1} - M_t), mixed per V row on the VPU inside the kernel (one read dot, two reverse
+  dots); the passthrough M stays unmixed. v5p XL kernel-only: read F/B +10%/+10% over the plain read.
+
+  shift_carry: the reverse walks token tiles last to first (tile axis sequential) and carries each
+  tile's first-token M_{t-1} cotangent into the previous tile's last token in VMEM, instead of adding
+  per-tile boundaries to dM in XLA (several whole-dM copies per layer). The boundary token is then cast
+  to the model dtype once rather than twice. 'auto' carries only when the per-device batch is >= 2.
+  stride_skew: token-major scratch row strides that are multiples of 32 move up by 8 (see _cpad);
+  'auto' only when the call's VMEM estimate times VMEM_OVERHEAD fits under vmem_mib.
+
+  m_norm (epsilon): optional whole-matrix pre-norm of the read view. Every read sees
+  M_read_t * rsqrt(mean(M_read_t^2) + epsilon), one FP32 statistic per token over all V x K entries
+  of the (shifted) matrix, cast to the model dtype; the passthrough M and its cotangent stay raw.
+
+  o_dynamic_scale [N,V]: optional learned per-head coordinate scale of the dynamic O key after its RMS
+  norm (static O and Q/K untouched). v_dynamic_scale optionally applies the same
+  mechanism to dynamic V, with independent parameters and complete gradients.
+  Both scale gradients use the existing tiled MXU reduction.
+  q_dynamic_scale / k_dynamic_scale [N,V] extend the same per-row scale to every arm (then all four
+  [4NP,C] rows are scaled; unset arms use ones); they scale only the dynamic Q/K read, not the standard arm.
+  Any of the four may instead be a per-head [N] scale (constant over V): leading such arms keep only a
+  c-summed [rows, T] gradient accumulator in the reverse, not C per-c scratch rows (2 MiB at C=64, NP=32).
+
+  qk_norm (ss_q, ss_k, m_q, m_k, epsilon): full-head QKNorm inside the read epilogue. ss_* [B,T,N] are
+  the standard (unscaled, unrotated) Q/K sums of squares; m_* [qdim] multiply the normalized row and
+  carry the norm scales and any logit scale (q_scale must then be 1). Returns normalized Q/K.
+
+  keys_cnt: the read keys already in kernel layout, [B,C,4N,T] (q, k, independent v, o) or [B,C,3N,T]
+  (q, k, shared vo), replacing q_key/k_key/vo_key; the kernel reads them through block views."""
+  b, t, n, cdim = q_key.shape
+  assert cdim == m.shape[2], 'v8t supports full-M reads (identity compression) only'
+  # Q/K width = retained M coordinates + standard (rotated) coordinates. It may exceed K (all K NoPE
+  # coordinates plus RoPE): the kernel then writes [T, qdim] rows itself (standard rows appended inside).
+  qdim = qk_cols + q_standard.shape[-1]
+  assert q_standard.shape == k_standard.shape and 0 <= qk_cols <= m.shape[-1] <= qdim, (qk_cols, qdim, m.shape)
+  np_ = _pad_rows(n) if pad_heads else n
+  if qk_norm is not None:
+    assert q_scale == 1.0, 'fold the logit scale into m_q'
+  packed = 0          # key slabs read from one kernel-layout array: 4 (q, k, v, o), 3 (q, k, vo) or 0
+  if keys_cnt is not None:
+    packed = keys_cnt.shape[2] // n
+    # Head counts that are not sublane multiples read the S*N rows as one block (_WholeKeys).
+    assert keys_cnt.shape in ((b, cdim, 4 * n, t), (b, cdim, 3 * n, t)) and not pad_heads, keys_cnt.shape
+  opts = _freeze(dict(heads=n, qk_cols=qk_cols, read_epsilon=read_epsilon, key_scale=key_scale, packed=packed,
+                      tile=forward_tile, reverse_tile=reverse_tile, vmem_mib=vmem_mib, interpret=interpret,
+                      q_scale=float(q_scale), chunk=chunk, **({'qdim': qdim} if qdim > m.shape[-1] else {}),
+                      **({'xhat_double_buffer': True} if xhat_double_buffer else {}),
+                      **({'shift_carry': shift_carry} if shift_carry and shift is not None else {}),
+                      **({'stride_skew': stride_skew} if stride_skew else {}),
+                      **({} if m_norm is None else {'m_norm': float(m_norm)}),
+                      **({} if qk_norm is None else {'qk_norm': (float(qk_norm[4]), float(qdim))})))
+  padn = lambda x: jnp.pad(x, [(0, 0)] * (x.ndim - 2) + [(0, np_ - n), (0, 0)]) if np_ > n else x
+  padn_tok = lambda x: jnp.pad(x, [(0, 0), (0, 0), (0, np_ - n), (0, 0)]) if np_ > n else x   # [B,T,NP,Rs]
+  keys = lambda x: padn(jnp.transpose(x, (0, 3, 2, 1)))                  # [B,T,N,C] -> [B,C,NP,T]
+  gate = lambda x: padn(_minor_t(x))                                      # [B,T,N] -> [B,NP,T]
+  sw = static_weight.astype(F32)
+  st = jnp.concatenate([jnp.pad(sw[a * n:(a + 1) * n], ((0, np_ - n), (0, 0))) for a in range(4)], axis=0)
+  if packed:          # the kernel reads Q, K and V/O through block views of the one array
+    rq_, rk_, rr_ = keys_cnt, keys_cnt, keys_cnt
+  else:
+    assert vo_key.shape[2] in (n, 2 * n), vo_key.shape
+    rr_ = (keys(vo_key) if vo_key.shape[2] == n else
+           jnp.concatenate(tuple(keys(x) for x in jnp.split(vo_key, 2, axis=2)), axis=2))
+    rq_, rk_ = keys(q_key), keys(k_key)
+  std = ((lambda x: padn_tok(x).reshape(b, t, -1)) if qk_norm is not None else _minor_t)
+  args = (m, st, rq_, gate(q_logits), rk_, gate(k_logits), rr_, gate(o_logits),
+          gate(v_logits), std(q_standard), std(k_standard))
+  gated = bool(static_gates)
+  if gated:
+    args += (jnp.stack([gate(x) for x in static_gates], axis=1),)       # [B,4,NP,T]
+  if shift is not None:
+    assert shift.shape == (b, t, cdim), shift.shape
+    args += (_minor_t(shift),)                                            # [B,V,T]
+  if o_weight_multiplier is not None:
+    # o_weight_multiplier [B,T,N,V]: per-token O address-weight multiplier (inverted dropout mask) on
+    # the effective O weight (static + gated dynamic, after the key RMS norm); V/Q/K keys untouched.
+    assert o_weight_multiplier.shape == (b, t, n, cdim), o_weight_multiplier.shape
+    args += (keys(o_weight_multiplier.astype(q_key.dtype)),)              # [B,C,NP,T]
+  all_arms = q_dynamic_scale is not None or k_dynamic_scale is not None
+  scaled = o_dynamic_scale is not None or v_dynamic_scale is not None or all_arms
+  if scaled:
+    for gamma in (q_dynamic_scale, k_dynamic_scale, v_dynamic_scale, o_dynamic_scale):
+      if gamma is not None:
+        assert gamma.shape in ((n, cdim), (n,)), gamma.shape
+    if all_arms:
+      scales = (q_dynamic_scale, k_dynamic_scale, v_dynamic_scale, o_dynamic_scale)
+    else:
+      scales = (v_dynamic_scale, o_dynamic_scale) if v_dynamic_scale is not None else (o_dynamic_scale,)
+    # Leading arms that are constant over c (unset or per-head [N]) skip per-c gradient scratch.
+    const_arms = 0
+    while const_arms < len(scales) and (scales[const_arms] is None or scales[const_arms].ndim == 1):
+      const_arms += 1
+    if const_arms:
+      opts = _freeze(dict(opts, scale_const_rows=const_arms * np_))
+    def widen(g):
+      g = jnp.ones((n, cdim), F32) if g is None else g.astype(F32)
+      g = jnp.broadcast_to(g[:, None], (n, cdim)) if g.ndim == 1 else g
+      return jnp.pad(g, ((0, np_ - n), (0, 0)), constant_values=1.) if np_ > n else g
+    os_ = jnp.concatenate(tuple(widen(g) for g in scales), axis=0)
+    args += (os_,)   # [NP,C] for O-only; [2NP,C] for independent V/O; [4NP,C] with Q/K.
+  normed = qk_norm is not None
+  if normed:
+    ss_q, ss_k, m_q, m_k = qk_norm[:4]
+    assert ss_q.shape == ss_k.shape == (b, t, n) and m_q.shape == m_k.shape == (qdim,), (ss_q.shape, m_q.shape)
+    args += (jnp.stack((gate(ss_q.astype(F32)), gate(ss_k.astype(F32))), axis=1),   # [B,2,NP,T]
+             jnp.stack((m_q, m_k), axis=0).astype(F32))                          # [2,qdim]
+
+  def local(m, st, *xs):
+    xs = list(xs)
+    qn = tuple(xs[-2:]) if normed else None
+    if normed:
+      xs = xs[:-2]
+    os = xs.pop() if scaled else None
+    om = xs.pop() if o_weight_multiplier is not None else None
+    sh = xs.pop() if shift is not None else None
+    sg = xs.pop() if gated else None
+    return _tm_read(m, st, *xs, sg, sh, om, os, qn, opts)
+
+  batched = (True, False) + (True,) * (len(args) - 2 - scaled - 2 * normed) + (False,) * scaled
+  batched += (True, False) * normed
+  outs = _map_batch(local, args, batched, 5)
+  outs = tuple(checkpoint_name(o, 'loom_read_out') for o in outs[:4]) + (outs[4],)
+  return tuple(jnp.transpose(o, (0, 2, 1, 3)) for o in outs[:4]) + (outs[4],)
+
+
+def _minor_t(x):
+  """[B,T,...] -> [B,...,T]."""
+  return jnp.moveaxis(x, 1, -1)
+
+
+def _write_content(x, eps, divisor):
+  """FP32 normalized or fixed-divisor content, before the write gate."""
+  x = x.astype(F32)
+  return _norm(x, eps, 0) if divisor is None else x / divisor
+
+
+def _tm_fill_factors(groups, a_scr, c_scr, eps, t, npt, divisors):
+  """a_scr / c_scr rows t*NPT + i: normalized address [V] / gated normalized content [K] of row i."""
+  off = 0
+  for g in range(0, len(groups), 3):
+    content, logits, address = groups[g:g + 3]
+    for h in range(content.shape[0]):
+      rows = pl.ds(off + h, t, stride=npt)        # token-major rows t*NPT + i
+      c = _write_content(content[h], eps, divisors[g // 3])
+      c_scr[rows, :] = _to_tokens(_sigmoid(logits[pl.ds(h, 1), :]) * c)
+      a_scr[rows, :] = _to_tokens(_norm(address[h], eps, 0))
+    off += content.shape[0]
+  for i in range(off, npt):
+    rows = pl.ds(i, t, stride=npt)
+    c_scr[rows, :] = jnp.zeros((t, c_scr.shape[1]), F32)
+    a_scr[rows, :] = jnp.zeros((t, a_scr.shape[1]), F32)
+
+
+def _tm_write_kernel(eps, n_groups, ch, divisors):
+  def kernel(m_ref, *refs):
+    groups = refs[:3 * n_groups]
+    refs = refs[3 * n_groups:]
+    out_ref, a_scr, c_scr = refs
+    t, vdim, kdim = m_ref.shape
+    npt = a_scr.shape[0] // t
+    dt = m_ref.dtype
+    _tm_fill_factors(groups, a_scr, c_scr, eps, t, npt, divisors)
+    for t0 in range(0, t, ch):
+      a = _chunk(a_scr, t0, ch, npt).astype(dt)
+      c = _chunk(c_scr, t0, ch, npt).astype(dt)
+      out_ref[pl.ds(t0, ch)] = (m_ref[pl.ds(t0, ch)].astype(F32) + _bdot(a, c, 1, 1)).astype(out_ref.dtype)
+  return kernel
+
+
+def _tm_write_backward_kernel(eps, n_groups, ch, divisors):
+  def kernel(g_ref, *refs):
+    groups = refs[:3 * n_groups]
+    refs = refs[3 * n_groups:]
+    outs = refs[:3 * n_groups]
+    a_scr, c_scr, da_scr, dc_scr = refs[3 * n_groups:]
+    t, vdim, kdim = g_ref.shape
+    npt = a_scr.shape[0] // t
+    dt = g_ref.dtype
+    _tm_fill_factors(groups, a_scr, c_scr, eps, t, npt, divisors)
+    for t0 in range(0, t, ch):
+      rows = pl.ds(t0 * npt, ch * npt)
+      gm = g_ref[pl.ds(t0, ch)]
+      a = _chunk(a_scr, t0, ch, npt).astype(dt)
+      c = _chunk(c_scr, t0, ch, npt).astype(dt)
+      da_scr[rows, :] = _bdot(c, gm, 2, 2).reshape(ch * npt, vdim)       # C_t G_t^T
+      dc_scr[rows, :] = _bdot(a, gm, 2, 1).reshape(ch * npt, kdim)       # A_t G_t
+    off = 0
+    for g in range(n_groups):
+      content, logits, address = groups[3 * g:3 * g + 3]
+      dcontent, dlogits, daddress = outs[3 * g:3 * g + 3]
+      norm_back = ((lambda x, u: _norm_backward(x, u, eps, 0)) if divisors[g] is None
+                   else (lambda x, u, d=divisors[g]: u / d))
+      for h in range(content.shape[0]):
+        rows = pl.ds(off + h, t, stride=npt)
+        x = content[h]
+        dci = _from_tokens(dc_scr[rows, :])
+        sg = _sigmoid(logits[pl.ds(h, 1), :])
+        written = _write_content(x, eps, divisors[g])
+        dlogits[pl.ds(h, 1), :] = (sg * (1 - sg) * jnp.sum(dci * written, axis=0, keepdims=True)
+                                   ).astype(dlogits.dtype)
+        u = sg * dci                                  # cotangent of the written content
+        dx = norm_back(x, u)
+        dcontent[h] = dx.astype(dcontent.dtype)
+        daddress[h] = _norm_backward(address[h], _from_tokens(da_scr[rows, :]), eps, 0).astype(daddress.dtype)
+      off += content.shape[0]
+  return kernel
+
+
+def _tm_write_scratch(groups, tile, vdim, kdim, flat=False):
+  npt = _pad_rows(sum(a.shape[1] for a in groups[2::3]))   # padded rows measured faster here
+  del flat        # row-major [rows*T] factors and per-chunk token-major results share the shape
+  return [pltpu.VMEM((tile * npt, vdim), F32), pltpu.VMEM((tile * npt, kdim), F32)]
+
+
+def _tm_write_forward_call(m, groups, opts):
+  b, t, vdim, kdim = m.shape
+  tile = min(opts['tile'], t)
+  mspec = _token_spec((vdim, kdim), tile)
+  return pl.pallas_call(
+      _tm_write_kernel(opts['epsilon'], len(groups) // 3, opts['chunk'], opts['content_divisors']),
+      grid=(b, t // tile),
+      in_specs=[mspec] + [_spec(x.shape[1:-1], tile) for x in groups],
+      out_specs=mspec, out_shape=jax.ShapeDtypeStruct(m.shape, m.dtype),
+      scratch_shapes=_tm_write_scratch(groups, tile, vdim, kdim), input_output_aliases={0: 0},
+      interpret=opts['interpret'], compiler_params=_params(('parallel', 'parallel'), opts['vmem_mib']),
+      name='loom_core_write')(m, *groups)
+
+
+def _tm_write_backward_call(g, groups, opts):
+  b, t, vdim, kdim = g.shape
+  tile = min(opts['reverse_tile'], t)
+  specs = [_spec(x.shape[1:-1], tile) for x in groups]
+  outs = pl.pallas_call(
+      _tm_write_backward_kernel(opts['epsilon'], len(groups) // 3, opts['chunk'], opts['content_divisors']),
+      grid=(b, t // tile),
+      in_specs=[_token_spec((vdim, kdim), tile)] + specs,
+      out_specs=specs,
+      out_shape=tuple(jax.ShapeDtypeStruct(x.shape, x.dtype) for x in groups),
+      scratch_shapes=_tm_write_scratch(groups, tile, vdim, kdim) + _tm_write_scratch(groups, tile, vdim, kdim, True),
+      interpret=opts['interpret'],
+      compiler_params=_params(('parallel', 'parallel'), opts['vmem_mib']),
+      name='loom_core_write_backward')(g, *groups)
+  return tuple(outs)
+
+
+@partial(jax.custom_vjp, nondiff_argnums=(1,))
+def _tm_write(m, opts, groups):
+  return _tm_write_forward_call(m, groups, dict(opts))
+
+
+def _tm_write_fwd(m, opts, groups):
+  return _tm_write_forward_call(m, groups, dict(opts)), groups
+
+
+def _tm_write_bwd(opts, res, g):
+  return g, _tm_write_backward_call(g, res, dict(opts))
+
+
+_tm_write.defvjp(_tm_write_fwd, _tm_write_bwd)
+
+
+def write_tm(m, groups, *, epsilon, forward_tile=128, reverse_tile=128, vmem_mib=None, interpret=False,
+             chunk=8, content_divisors=None, **_):
+  """M [B,T,V,K] plus attention and independent memory-MLP writes."""
+  content_divisors = tuple(content_divisors) if content_divisors is not None else (None,) * len(groups)
+  if len(content_divisors) != len(groups) or any(
+      x is not None and (not isinstance(x, (int, float)) or isinstance(x, bool) or not math.isfinite(x) or x <= 0)
+      for x in content_divisors):
+    raise ValueError('Each write group requires None (RMS) or a positive finite fixed divisor')
+  opts = _freeze(dict(epsilon=epsilon, tile=forward_tile, reverse_tile=reverse_tile, vmem_mib=vmem_mib,
+                      interpret=interpret, chunk=chunk, content_divisors=content_divisors))
+  flat = tuple(_minor_t(x) for grp in groups for x in grp)
+  return _map_batch(lambda m, *xs: _tm_write(m, opts, xs),
+                    (m,) + flat, (True,) * (1 + len(flat)), 1)
+
+
+def make_strict_causal_splash(kernel, neg_logit: float = -1e9):
+  """Wrap Splash attention with offset=-1 so empty row 0 returns exact zero."""
+  def apply(q, k, v, segment_ids=None):
+    return kernel(q, k, v, segment_ids=segment_ids,
+                  sinks=jnp.full((q.shape[0],), neg_logit, jnp.float32))
+  return apply
+
+
+read = read_tm
+write = write_tm

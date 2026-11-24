@@ -1,0 +1,7 @@
+torch>=2.5.0
+triton>=3.1.0
+transformers>=4.46.0
+safetensors>=0.4.5
+tokenizers>=0.20.0
+numpy>=1.26.0
+tensorstore>=0.1.65  # optional: only required when converting Orbax OCDBT checkpoints directly

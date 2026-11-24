@@ -1,0 +1,55 @@
+# LoomFormer-XL (1,432,396,996 params; Paper Section 5.1 & Appendix D)
+base_config: "base.yml"
+
+# Backbone & dimensions (D = 20 * 96 = 1920, L = 28)
+base_emb_dim: 1920
+base_num_query_heads: 20
+base_num_kv_heads: 20
+head_dim: 96
+base_mlp_dim: 4048
+base_num_decoder_layers: 28
+vocab_size: 50432
+logits_via_embedding: False
+normalization_layer_epsilon: 1.0e-6
+enable_dropout: False
+dropout_rate: 0.0
+max_target_length: 4096
+
+# LoomFormer hyperparameters (0.0016052833 * sqrt(1920 / 1200) = 0.0020305404338184567)
+loom_backbone: "llama"
+loom_d_k: 40
+loom_d_r: 400
+loom_rope_dim: 24
+loom_ffn_m_dim: 1827
+loom_last_ffn_x_dim: 6277
+loom_embed_write_divisor: 0.0020305404338184567
+loom_pallas: True
+loom_splash: True
+loom_pallas_vmem_mib: 63
+
+# Splash Attention block sizes
+sa_block_q: 1024
+sa_block_kv: 1024
+sa_block_kv_compute: 512
+sa_block_q_dkv: 1024
+sa_block_kv_dkv: 1024
+sa_block_kv_dkv_compute: 1024
+sa_use_fused_bwd_kernel: True
+remat_policy: "full"
+
+# Optimizer & schedule (v5p-32 = 16 chips, global batch 128 sequences)
+opt_type: "adam_pax"
+learning_rate: 2.0e-4
+learning_rate_final_fraction: 0.1
+warmup_steps_fraction: 0.01
+adam_b1: 0.9
+adam_b2: 0.95
+adam_eps: 1.0e-8
+adam_weight_decay: 0.1
+adamw_mask: ['.*scale$', '.*bias$', '.*b_rg.*', '.*b_wg$', '.*b_sg$', '.*c_qk$', '.*c_vo$']
+gradient_clipping_threshold: 1.0
+per_device_batch_size: 8.0
+steps: 50000
+learning_rate_schedule_steps: 50000
+eval_interval: 50000
+enable_nnx: False
