@@ -1,8 +1,8 @@
 """Training entrypoint for LoomFormer & LoomPythia on official `maxtext-v0.2.0` (zero patches).
 
 Usage:
-  python jax/train_loom.py jax/configs/loompythia_2p8b.yml \
-      run_name=loompythia_2p8b \
+  python jax/train_loom.py jax/configs/loomformer_medium.yml \
+      run_name=loomformer_medium \
       base_output_directory=gs://your-bucket/runs \
       dataset_type=hf hf_path=EleutherAI/pile
 """
@@ -13,8 +13,7 @@ JAX_ROOT = os.path.dirname(os.path.abspath(__file__))
 if JAX_ROOT not in sys.path:
   sys.path.insert(0, JAX_ROOT)
 
-from loomformer.config import extract_loom_and_maxtext_argv  # noqa: E402
-from loomformer.loom import LoomTransformer  # noqa: E402
+from loomformer import build_loom_model, extract_loom_and_maxtext_argv  # noqa: E402
 
 
 def main(argv=None):
@@ -25,11 +24,11 @@ def main(argv=None):
     from maxtext.trainers.pre_train import train as mt_train
     from maxtext.utils import model_creation_utils
 
-    def _build_loom_model(config, mesh, quant, model_mode="train", rngs=None):
+    def _create_model(config, mesh, quant, model_mode="train", rngs=None):
       del rngs
-      return LoomTransformer(config=config, mesh=mesh, quant=quant, loom_cfg=loom_cfg, model_mode=model_mode)
+      return build_loom_model(config=config, mesh=mesh, quant=quant, loom_cfg=loom_cfg, model_mode=model_mode)
 
-    model_creation_utils.get_transformer_model = _build_loom_model
+    model_creation_utils.get_transformer_model = _create_model
     mt_train.main(mt_argv)
   finally:
     if os.path.exists(tmp_yml):

@@ -65,7 +65,6 @@ def _map_batch(fn, args, batch_args, n_out):
   if not mesh.axis_names or mesh.size == 1:
     return fn(*args)
   from flax import linen as nn
-  from jax.experimental.shard_map import shard_map
   from jax.sharding import PartitionSpec as P
   axes = nn.logical_to_mesh_axes(('activation_batch',))[0]
   names = (axes,) if isinstance(axes, str) else (axes or ())
@@ -73,8 +72,11 @@ def _map_batch(fn, args, batch_args, n_out):
     raise ValueError('Loom Pallas core supports batch/FSDP mesh axes only')
   spec = P(axes)
   out_specs = spec if n_out == 1 else (spec,) * n_out
-  return shard_map(fn, mesh=mesh, in_specs=tuple(spec if b else P() for b in batch_args),
-                   out_specs=out_specs, check_rep=False)(*args)
+  in_specs = tuple(spec if b else P() for b in batch_args)
+  if hasattr(jax, 'shard_map'):
+    return jax.shard_map(fn, mesh=mesh, in_specs=in_specs, out_specs=out_specs, check_vma=False)(*args)
+  from jax.experimental.shard_map import shard_map
+  return shard_map(fn, mesh=mesh, in_specs=in_specs, out_specs=out_specs, check_rep=False)(*args)
 
 
 def static_weight(static_q, static_k, static_v, static_o, compression):
@@ -650,7 +652,7 @@ def _whole_keys(n, packed):
 
 
 def _hbm():
-  return pl.BlockSpec(memory_space=pltpu.ANY)
+  return pl.BlockSpec(memory_space=getattr(pl, 'ANY', None) or pltpu.ANY)
 
 
 def _key_shapes(args, packed):
@@ -1213,3 +1215,247 @@ def make_strict_causal_splash(kernel, neg_logit: float = -1e9):
 
 read = read_tm
 write = write_tm
+
+
+# ==============================================================================
+# High-Level TPU Splash & Fused-Projection Adapters for `LoomMHA` / `LoomPythiaMHA`
+# ==============================================================================
+
+def strict_causal_splash(query, key, value, segment_ids, cfg, lc, mesh, window=None, seq_minor=False):
+  """Strictly causal (`s < t`) TPU Splash Attention wrapper."""
+  from flax import linen as nn
+  from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_kernel
+  from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask
+
+  q, k, v = (jnp.transpose(x, (0, 2, 1, 3)) for x in (query, key, value))  # btnh -> bnht
+  t = q.shape[2]
+  axis_names = nn.logical_to_mesh_axes(("activation_batch", "activation_heads", "activation_length", "activation_kv"))
+  seg_names = nn.logical_to_mesh_axes(("activation_batch", "activation_length_no_exp"))
+  segments = (
+      None if segment_ids is None or lc.loom_splash_ignore_segments
+      else splash_attention_kernel.SegmentIds(segment_ids, segment_ids)
+  )
+
+  def body(q, k, v, segments=None):
+    fused = cfg.sa_use_fused_bwd_kernel
+    block_sizes = splash_attention_kernel.BlockSizes(
+        block_q=min(cfg.sa_block_q, t),
+        block_kv=min(cfg.sa_block_kv, t),
+        block_kv_compute=min(cfg.sa_block_kv_compute, t),
+        block_q_dkv=min(cfg.sa_block_q_dkv, t),
+        block_kv_dkv=min(cfg.sa_block_kv_dkv, t),
+        block_kv_dkv_compute=min(cfg.sa_block_kv_dkv_compute, t),
+        block_q_dq=None if fused else min(cfg.sa_block_q_dq, t),
+        block_kv_dq=None if fused else min(cfg.sa_block_kv_dq, t),
+        use_fused_bwd_kernel=fused,
+        q_layout=splash_attention_kernel.QKVLayout["SEQ_MINOR" if seq_minor else cfg.sa_q_layout],
+        k_layout=splash_attention_kernel.QKVLayout["SEQ_MINOR" if seq_minor else cfg.sa_k_layout],
+        v_layout=splash_attention_kernel.QKVLayout["SEQ_MINOR" if seq_minor else cfg.sa_v_layout],
+    )
+    mask = splash_attention_mask.CausalMask(shape=(t, t), offset=-1)
+    if window is not None and window < t:
+      mask &= splash_attention_mask.LocalMask(shape=(t, t), window_size=(window - 1, 0), offset=0)
+    mask = splash_attention_mask.MultiHeadMask(masks=(mask,) * q.shape[1])
+    res_name = lc.loom_splash_residual_name or None
+    soft_cap = cfg.attn_logits_soft_cap if getattr(cfg, "attn_logits_soft_cap", 0.0) else None
+    kernel = splash_attention_kernel.make_splash_mha(
+        mask=mask,
+        head_shards=1,
+        q_seq_shards=1,
+        block_sizes=block_sizes,
+        attn_logits_soft_cap=soft_cap,
+        **({"residual_checkpoint_name": res_name} if res_name else {}),
+    )
+    kernel = make_strict_causal_splash(kernel)
+    return jax.vmap(kernel)(q, k, v, segment_ids=segments)
+
+  def _smap(fn, in_specs, *xs):
+    if hasattr(jax, "shard_map"):
+      return jax.shard_map(fn, mesh=mesh, in_specs=in_specs, out_specs=axis_names, check_vma=False)(*xs)
+    from jax.experimental.shard_map import shard_map
+    return shard_map(fn, mesh=mesh, in_specs=in_specs, out_specs=axis_names, check_rep=False)(*xs)
+
+  out = (
+      _smap(body, (axis_names,) * 3, q, k, v) if segments is None
+      else _smap(body, (axis_names, axis_names, axis_names, seg_names), q, k, v, segments)
+  )
+  return jnp.transpose(out, (0, 2, 1, 3))
+
+
+def _lookup_subtree(tree, path):
+  cur = tree
+  for key in path:
+    cur = cur[key]
+  return cur
+
+
+def _fused_x_projections(x, params, paths, dtype, matmul_precision):
+  """Concatenate tokenwise `x`-projections along output columns into one `dot_general`."""
+  from flax import linen as nn
+  kernels, shapes, biases = [], [], []
+  for path in paths:
+    p = _lookup_subtree(params, path)
+    k = jnp.asarray(nn.meta.unbox(p["kernel"]), dtype)
+    shapes.append(k.shape[1:])
+    kernels.append(k.reshape(k.shape[0], -1))
+    b = p.get("bias") if hasattr(p, "get") else None
+    biases.append(None if b is None else jnp.asarray(nn.meta.unbox(b), dtype))
+  y = jax.lax.dot_general(
+      jnp.asarray(x, dtype),
+      jnp.concatenate(kernels, axis=1),
+      (((x.ndim - 1,), (0,)), ((), ())),
+      precision=jax.lax.Precision(matmul_precision),
+  )
+  widths = [k.shape[1] for k in kernels]
+  cuts = [sum(widths[: i + 1]) for i in range(len(widths) - 1)]
+  parts = jnp.split(y, cuts, axis=-1) if cuts else [y]
+  return {
+      path: (part.reshape(x.shape[:-1] + shape) if bias is None else part.reshape(x.shape[:-1] + shape) + bias)
+      for path, shape, part, bias in zip(paths, shapes, parts, biases)
+  }
+
+
+def mha_forward(mha, x, positions, segment_ids, M_in, window, *,
+                use_qk_norm: bool, logit_scale_dim: int, valid_shift_mask):
+  """Fused TPU Pallas execution path for `LoomMHA` and `LoomPythiaMHA`."""
+  from flax import linen as nn
+  cfg, lc = mha.config, mha.loom_cfg
+  b, t = x.shape[:2]
+  n, d, d_k, r_dim = cfg.num_query_heads, cfg.head_dim, lc.loom_d_k, lc.loom_rope_dim
+  read_eps = float(lc.loom_read_key_eps)
+  key_scale = float(lc.loom_read_key_scale)
+  stat_init = float(lc.loom_static_read_gate_init)
+
+  fused = not mha.is_initializing()
+  if fused:
+    params = mha.variables["params"]
+    proj_paths = (
+        ("W_q",), ("W_k",), ("W_r1",),
+        ("read_q", "W_rg"), ("read_k", "W_rg"), ("read_v", "W_rg"), ("read_o", "W_rg"),
+        ("read_q", "W_rg_bar"), ("read_k", "W_rg_bar"), ("read_v", "W_rg_bar"), ("read_o", "W_rg_bar"),
+        ("m_shift", "W_sg"),
+    ) + ((("W_w1",), ("m_write", "W_wg")) if mha.write_M else ())
+    raw = _fused_x_projections(x, params, proj_paths, cfg.dtype, cfg.matmul_precision)
+    qr, kr = raw[("W_q",)], raw[("W_k",)]
+    xr = nn.gelu(raw[("W_r1",)])
+
+    def unbox(path):
+      return nn.meta.unbox(_lookup_subtree(params, path))
+
+    dyn = {
+        a: raw[(f"read_{a}", "W_rg")] + jnp.asarray(unbox((f"read_{a}", "b_rg")), cfg.dtype)
+        for a in ("q", "k", "v", "o")
+    }
+    stat = {
+        a: (1.1 / stat_init) * jax.nn.sigmoid(
+            raw[(f"read_{a}", "W_rg_bar")] + jnp.asarray(unbox((f"read_{a}", "b_rg_bar")), cfg.dtype)
+        )
+        for a in ("q", "k", "v", "o")
+    }
+    kernels = [jnp.asarray(unbox((f"read_{a}", "W_r2", "kernel")), cfg.dtype) for a in ("q", "k", "v", "o")]
+    biases = [jnp.asarray(unbox((f"read_{a}", "W_r2", "bias")), cfg.dtype) for a in ("q", "k", "v", "o")]
+    ones_tok = jnp.ones((b, t, 1), xr.dtype)
+    weight_up = jnp.concatenate((jnp.concatenate(kernels, axis=1), jnp.concatenate(biases, axis=0)[None]), axis=0)
+    packed_qkvo = jnp.einsum(
+        "btm,mkc->bckt", jnp.concatenate((xr, ones_tok), axis=-1), weight_up,
+        precision=jax.lax.Precision(cfg.matmul_precision),
+    )
+    q_key = jnp.zeros((b, t, n, d_k), cfg.dtype)
+    k_key = q_key
+    vo_key = jnp.zeros((b, t, 2 * n, d_k), cfg.dtype)
+    shift_logits = raw[("m_shift", "W_sg")].astype(F32) + jnp.asarray(unbox(("m_shift", "b_sg")), F32)
+  else:
+    qr, kr = mha.W_q(x), mha.W_k(x)
+    xr = nn.gelu(mha.W_r1(x))
+    # Initialize `read_o` before `read_v` so `loom_clone_vo_init` can clone `read_o/W_r2`
+    o_key, o_dyn, o_stat = mha.read_o.raw_ports(x, xr)
+    v_key, v_dyn, v_stat = mha.read_v.raw_ports(x, xr)
+    q_key, q_dyn, q_stat = mha.read_q.raw_ports(x, xr)
+    k_key, k_dyn, k_stat = mha.read_k.raw_ports(x, xr)
+    dyn = {"q": q_dyn, "k": k_dyn, "v": v_dyn, "o": o_dyn}
+    stat = {"q": q_stat, "k": k_stat, "v": v_stat, "o": o_stat}
+    vo_key = jnp.concatenate((v_key, o_key), axis=-2)
+    packed_qkvo = None
+    shift_logits = mha.m_shift.logits(x)
+
+  params = mha.variables["params"]
+  if not use_qk_norm:
+    qr = mha.rotary_q(qr, positions)
+    kr = mha.rotary_k(kr, positions)
+    qk_norm_arg = None
+    q_scale = 1.0 / math.sqrt(logit_scale_dim)
+  else:
+    q_mult = jnp.asarray(mha.q_norm_scale, F32)
+    k_mult = jnp.asarray(mha.k_norm_scale, F32)
+    ss_q = jnp.sum(jnp.square(qr.astype(F32)), axis=-1)
+    ss_k = jnp.sum(jnp.square(kr.astype(F32)), axis=-1)
+    qr = mha.rotary_q(qr * q_mult[d:].astype(qr.dtype), positions)
+    kr = mha.rotary_k(kr * k_mult[d:].astype(kr.dtype), positions)
+    ones_r = jnp.ones((r_dim,), F32)
+    m_q = jnp.concatenate((q_mult[:d], ones_r)) / math.sqrt(logit_scale_dim)
+    m_k = jnp.concatenate((k_mult[:d], ones_r))
+    qk_norm_arg = (ss_q, ss_k, m_q, m_k, float(cfg.normalization_layer_epsilon))
+    q_scale = 1.0
+
+  c_qk, c_vo = mha.c_qk[0], mha.c_vo[0]
+  q_bar_q = nn.meta.unbox(params["read_q"]["q_bar"])
+  q_bar_k = nn.meta.unbox(params["read_k"]["q_bar"])
+  q_bar_v = nn.meta.unbox(params["read_v"]["q_bar"])
+  q_bar_o = nn.meta.unbox(params["read_o"]["q_bar"])
+  sw = static_weight(
+      (q_bar_q * c_qk.astype(q_bar_q.dtype)).T,
+      (q_bar_k * c_qk.astype(q_bar_k.dtype)).T,
+      (q_bar_v * c_vo.astype(q_bar_v.dtype)).T,
+      (q_bar_o * c_vo.astype(q_bar_o.dtype)).T,
+      jnp.eye(d_k, dtype=q_bar_q.dtype),
+  )
+  shift = jnp.where(
+      valid_shift_mask[..., None],
+      jax.nn.sigmoid(shift_logits).astype(M_in.dtype),
+      jnp.zeros((b, t, d_k), M_in.dtype),
+  )
+
+  ones_n = jnp.ones((n,), F32)
+  outs = read(
+      M_in, sw,
+      q_key, dyn["q"],
+      k_key, dyn["k"],
+      vo_key, dyn["o"], dyn["v"],
+      qr, kr,
+      qk_cols=d,
+      read_epsilon=read_eps,
+      key_scale=key_scale,
+      forward_tile=128,
+      reverse_tile=128,
+      vmem_mib=lc.loom_pallas_vmem_mib,
+      q_scale=q_scale,
+      static_gates=(stat["q"], stat["k"], stat["v"], stat["o"]),
+      shift=shift,
+      m_norm=float(cfg.normalization_layer_epsilon),
+      q_dynamic_scale=c_qk.astype(F32) * ones_n,
+      k_dynamic_scale=c_qk.astype(F32) * ones_n,
+      v_dynamic_scale=c_vo.astype(F32) * ones_n,
+      o_dynamic_scale=c_vo.astype(F32) * ones_n,
+      qk_norm=qk_norm_arg,
+      keys_cnt=packed_qkvo,
+      shift_carry="auto",
+      stride_skew="auto",
+  )
+  q, k, v, o_m, M_pass = outs[:5]
+  q = nn.with_logical_constraint(q, ("activation_kv_batch", "activation_length", "activation_kv_heads", "activation_kv_head_dim"))
+  k = nn.with_logical_constraint(k, ("activation_kv_batch", "activation_length", "activation_kv_heads", "activation_kv_head_dim"))
+  v = nn.with_logical_constraint(v, ("activation_kv_batch", "activation_length", "activation_kv_heads", "activation_kv_head_dim"))
+
+  o = o_m + mha.attend(q, k, v, segment_ids, window, seq_minor_default=False)
+  o = nn.with_logical_constraint(o, ("activation_batch", "activation_length", "activation_heads", "activation_kv"))
+  dx = mha.W_o(o)
+
+  if not mha.write_M:
+    return dx, M_pass, None
+  if fused:
+    xw = nn.gelu(raw[("W_w1",)])
+    km_raw = mha.m_write.W_w2(xw)
+    wg_logits = raw[("m_write", "W_wg")] + jnp.asarray(nn.meta.unbox(params["m_write"]["b_wg"]), cfg.dtype)
+    return dx, M_pass, (o, wg_logits, km_raw)
+  xw = nn.gelu(mha.W_w1(x))
+  return dx, M_pass, mha.m_write.factors(o, x, xw)

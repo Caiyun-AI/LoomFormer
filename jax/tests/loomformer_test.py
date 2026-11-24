@@ -16,7 +16,7 @@ if JAX_ROOT not in sys.path:
 os.makedirs("/tmp/jax_cache_loomtest", exist_ok=True)
 compilation_cache.set_cache_dir("/tmp/jax_cache_loomtest")
 
-from loomformer import LoomTransformer, extract_loom_and_maxtext_argv  # noqa: E402
+from loomformer import LoomFormer, LoomPythia, build_loom_model, extract_loom_and_maxtext_argv  # noqa: E402
 from maxtext.configs import pyconfig  # noqa: E402
 from maxtext.optimizers import optimizers  # noqa: E402
 from maxtext.trainers.pre_train import train as mt_train  # noqa: E402
@@ -40,29 +40,34 @@ def _init_configs(yml_name: str, extra_args: list[str]):
 
 class LoomFormerZeroPatchTest(unittest.TestCase):
 
-  def test_exact_paper_param_counts(self):
-    """Verify exact integer parameter counts across all 5 YAML configurations."""
+  def test_exact_paper_param_counts_and_submodule_structure(self):
+    """Verify exact integer parameter counts across all 5 YAML configs for `LoomFormer` & `LoomPythia`."""
     expected = {
-        "loomformer_medium.yml": 432_112_228,
-        "loomformer_large.yml": 777_849_500,
-        "loomformer_xl.yml": 1_432_396_996,
-        "loomformer_xl_situ.yml": 1_432_396_996,
-        "loompythia_2p8b.yml": 2_775_190_944,
+        "loomformer_medium.yml": (LoomFormer, 432_112_228),
+        "loomformer_large.yml": (LoomFormer, 777_849_500),
+        "loomformer_xl.yml": (LoomFormer, 1_432_396_996),
+        "loomformer_xl_situ.yml": (LoomFormer, 1_432_396_996),
+        "loompythia_2p8b.yml": (LoomPythia, 2_775_190_944),
     }
     x = jnp.zeros((1, 256), dtype=jnp.int32)
     pos = jnp.broadcast_to(jnp.arange(256, dtype=jnp.int32)[None, :], (1, 256))
     rng = jax.random.PRNGKey(0)
 
-    for yml_name, exp_cnt in expected.items():
+    for yml_name, (exp_cls, exp_cnt) in expected.items():
       mt_cfg, loom_cfg, mesh = _init_configs(yml_name, ["per_device_batch_size=1", "max_target_length=256", "num_vocab_tiling=1"])
-      model = LoomTransformer(config=mt_cfg, mesh=mesh, loom_cfg=loom_cfg)
+      model = build_loom_model(config=mt_cfg, mesh=mesh, loom_cfg=loom_cfg)
+      self.assertIsInstance(model, exp_cls)
       av = jax.eval_shape(lambda k: model.init(k, x, pos, enable_dropout=False), rng)
       cnt = sum(int(np.prod(v.shape)) for v in jax.tree_util.tree_leaves(av["params"]))
       self.assertEqual(cnt, exp_cnt, f"{yml_name}: got {cnt:,}, expected {exp_cnt:,}")
       dec = av["params"]["decoder"]
-      self.assertIn("embed_write", dec)
-      self.assertIn("W_w1", dec["layers"]["loom_mha"])
-      self.assertNotIn("W_w1", dec["last_layer"]["loom_mha"])
+      self.assertIn("m_write", dec["embed_write"])
+      self.assertIn("read_q", dec["layers"]["loom_mha"])
+      self.assertIn("m_shift", dec["layers"]["loom_mha"])
+      self.assertIn("m_write", dec["layers"]["loom_mha"])
+      self.assertIn("ffn_m_write", dec["layers"])
+      self.assertNotIn("m_write", dec["last_layer"]["loom_mha"])
+      self.assertNotIn("ffn_m_write", dec["last_layer"])
 
   def _check_pure_vs_pallas(self, yml_name: str, extra: list[str], dtype_str: str,
                             fwd_atol: float, grad_rtol: float, grad_atol: float):
@@ -84,8 +89,8 @@ class LoomFormerZeroPatchTest(unittest.TestCase):
 
     mt_ref, lc_ref, mesh = _init_configs(yml_name, base_args + ["loom_pallas=False", "loom_splash=False"])
     mt_pal, lc_pal, _ = _init_configs(yml_name, base_args + ["loom_pallas=True", "loom_splash=True"])
-    mdl_ref = LoomTransformer(config=mt_ref, mesh=mesh, loom_cfg=lc_ref)
-    mdl_pal = LoomTransformer(config=mt_pal, mesh=mesh, loom_cfg=lc_pal)
+    mdl_ref = build_loom_model(config=mt_ref, mesh=mesh, loom_cfg=lc_ref)
+    mdl_pal = build_loom_model(config=mt_pal, mesh=mesh, loom_cfg=lc_pal)
 
     b, t = 2, 256
     k_init, k_tok, k_tgt = jax.random.split(jax.random.PRNGKey(42), 3)
@@ -95,6 +100,14 @@ class LoomFormerZeroPatchTest(unittest.TestCase):
     pos = jnp.broadcast_to(jnp.concatenate([jnp.arange(128), jnp.arange(128)])[None, :], (b, t)).astype(jnp.int32)
 
     vars0 = mdl_pal.init(k_init, tokens, pos, decoder_segment_ids=seg, enable_dropout=False)
+    # Verify `loom_clone_vo_init` cloned `read_o/W_r2/kernel` into `read_v/W_r2/kernel`
+    from flax import linen as nn
+    mha0 = vars0["params"]["decoder"]["layers"]["loom_mha"]
+    np.testing.assert_array_equal(
+        np.asarray(nn.meta.unbox(mha0["read_v"]["W_r2"]["kernel"])),
+        np.asarray(nn.meta.unbox(mha0["read_o"]["W_r2"]["kernel"])),
+    )
+
     flat_p, treedef = jax.tree_util.tree_flatten_with_path(vars0["params"])
     pert = []
     for idx, (path, leaf) in enumerate(flat_p):
@@ -129,12 +142,21 @@ class LoomFormerZeroPatchTest(unittest.TestCase):
         cos = float(np.dot(a, b_arr) / (nr * max(np_, 1e-12)))
         self.assertGreater(cos, min_cos, f"Grad cosine {cos:.6f} <= {min_cos} in {name}")
 
-  def test_pure_vs_pallas_llama_odd_head_dim(self):
-    extra = ["base_num_decoder_layers=4", "vocab_size=1024"]
-    self._check_pure_vs_pallas("loomformer_medium.yml", extra, "float32", 1e-3, 4.5e-2, 5e-3)
-    self._check_pure_vs_pallas("loomformer_medium.yml", extra, "bfloat16", 2e-2, 8e-2, 3e-2)
+  def test_pure_vs_pallas_loomformer_odd_head_dim_and_situ_nondiv8_heads(self):
+    # Medium: odd `head_dim=75`, `n=16`
+    extra_med = ["base_num_decoder_layers=4", "vocab_size=1024"]
+    self._check_pure_vs_pallas("loomformer_medium.yml", extra_med, "float32", 1e-3, 4.5e-2, 5e-3)
+    self._check_pure_vs_pallas("loomformer_medium.yml", extra_med, "bfloat16", 2e-2, 8e-2, 3e-2)
+    # XL-SiTU style: `n=4` (`n % 8 != 0`, exercising `_whole_keys` HBM slab path) + SiTU-GLU
+    extra_xl = [
+        "base_emb_dim=384", "base_num_query_heads=4", "base_num_kv_heads=4", "head_dim=96",
+        "base_mlp_dim=768", "base_num_decoder_layers=3",
+        "loom_d_k=8", "loom_d_r=32", "loom_rope_dim=24",
+        "loom_ffn_m_dim=384", "loom_last_ffn_x_dim=1152", "vocab_size=1024",
+    ]
+    self._check_pure_vs_pallas("loomformer_xl_situ.yml", extra_xl, "bfloat16", 2e-2, 8e-2, 3e-2)
 
-  def test_pure_vs_pallas_pythia_qknorm_and_bf16_dot_fp32(self):
+  def test_pure_vs_pallas_loompythia_qknorm_and_bf16_dot_fp32(self):
     extra = [
         "base_emb_dim=640", "base_num_query_heads=8", "base_num_kv_heads=8", "head_dim=80",
         "base_mlp_dim=1792", "base_num_decoder_layers=4",
@@ -145,7 +167,7 @@ class LoomFormerZeroPatchTest(unittest.TestCase):
     self._check_pure_vs_pallas("loompythia_2p8b.yml", extra, "bfloat16", 2e-2, 8e-2, 3e-2)
 
   def test_official_maxtext_train_step_with_vocab_tiling(self):
-    """Run 5 compiled official `maxtext-v0.2.0` `train_step` iterations (with `num_vocab_tiling=2` + `adam_pax` + `adamw_mask`)."""
+    """Run 5 compiled official `maxtext-v0.2.0` `train_step` iterations (`num_vocab_tiling=2` + `adam_pax` + `adamw_mask`)."""
     mt_cfg, loom_cfg, mesh = _init_configs("loompythia_2p8b.yml", [
         "base_emb_dim=640", "base_num_query_heads=8", "base_num_kv_heads=8", "head_dim=80",
         "base_mlp_dim=1792", "base_num_decoder_layers=4",
@@ -158,7 +180,7 @@ class LoomFormerZeroPatchTest(unittest.TestCase):
         "sa_block_q_dkv=128", "sa_block_kv_dkv=128", "sa_block_kv_dkv_compute=128",
         "sa_block_q_dq=128", "sa_block_kv_dq=128",
     ])
-    model = LoomTransformer(config=mt_cfg, mesh=mesh, loom_cfg=loom_cfg)
+    model = build_loom_model(config=mt_cfg, mesh=mesh, loom_cfg=loom_cfg)
     lr_sched = maxtext_utils.create_learning_rate_schedule(mt_cfg)
     tx = optimizers.get_optimizer(mt_cfg, lr_sched, model)
     state, _, state_mesh_shardings, _ = maxtext_utils.setup_training_state(

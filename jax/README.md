@@ -2,12 +2,14 @@
 
 This directory contains the standalone JAX/Flax training implementation of **LoomFormer** and **LoomPythia** on top of official **[AI-Hypercomputer/maxtext (`maxtext-v0.2.0`)](https://github.com/AI-Hypercomputer/maxtext/releases/tag/maxtext-v0.2.0)** as a pure external dependency (**zero patches or forked MaxText files**).
 
+All modules follow a PyTorch-familiar `setup()` (define parameters & submodules) + `__call__()` (forward pass) layout, with `einsum` / shape annotations matching Paper Section 3.2 and Appendix C (`loomformer_pseudo.py`).
+
 ## Directory Structure
 
 ```text
 jax/
-├── requirements_tpu.txt          # Pins official maxtext[tpu] @ maxtext-v0.2.0 (jax>=0.8.1, flax>=0.12.1)
-├── train_loom.py                 # Training entrypoint plugging LoomTransformer into MaxText's train_loop
+├── requirements_tpu.txt          # Pins official maxtext[tpu] @ maxtext-v0.2.0 (jax[tpu]==0.11.0)
+├── train_loom.py                 # Training entrypoint plugging LoomFormer / LoomPythia into MaxText's train_loop
 ├── configs/                      # Paper model YAML configurations
 │   ├── loomformer_medium.yml     # LoomFormer-Medium (432M, D=1200, n=16, d=75, d_k=32, D_r=256, r=18)
 │   ├── loomformer_large.yml      # LoomFormer-Large  (778M, D=1536, n=16, d=96, d_k=32, D_r=256, r=24)
@@ -16,9 +18,10 @@ jax/
 │   └── loompythia_2p8b.yml       # LoomPythia-2.8B   (2.78B, D=2560, n=32, d=80, d_k=64, D_r=640, r=20)
 ├── loomformer/
 │   ├── config.py                 # LoomConfig dataclass & YAML/CLI config splitter
-│   ├── loom.py                   # Self-contained LoomEmbedWrite, LoomMHA, LoomDecoderLayer, LoomTransformer,
-│   │                             # SiTU-GLU (`situ_activation`), and `bf16_dot_fp32_output`
-│   └── loom_pallas.py            # Self-contained forward/backward TPU Pallas `read` & `write` kernels
+│   ├── loomformer.py             # Core Loom primitives (MShift, MRead, MWrite, LoomEmbedWrite) and
+│   │                             # Llama-backbone LoomFormer (LoomMHA, LoomDecoderLayer, LoomDecoder, LoomFormer)
+│   ├── loompythia.py             # Pythia-backbone LoomPythia (LayerNorm + GELU + QKNorm + bf16_dot_fp32_output)
+│   └── loom_pallas.py            # Fused forward/backward TPU Pallas `read` & `write` kernels + Splash adapters
 └── tests/
     └── loomformer_test.py        # Parameter counts, pure-JAX vs. Pallas parity, and official train_step tests
 ```
@@ -53,10 +56,10 @@ python jax/train_loom.py jax/configs/loomformer_medium.yml \
   steps=10
 ```
 
-Set `loom_pallas=False` on the command line to switch from the fused TPU Pallas kernels (`loom_pallas.py`) to the pure-JAX `einsum` reference path (`loom.py`) on the identical parameter tree.
+Set `loom_pallas=False` on the command line to switch from the fused TPU Pallas kernels (`loom_pallas.py`) to the pure-JAX `einsum` reference path (`loomformer.py` / `loompythia.py`) on the identical parameter tree.
 
 ## Running Tests
 
 ```bash
-python -m unittest -v jax/tests/loomformer_test.py
+python jax/tests/loomformer_test.py -v
 ```

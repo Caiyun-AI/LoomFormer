@@ -68,7 +68,7 @@ For maximum throughput, `pytorch/fast_inference` provides fused Triton kernels +
 
 In practice, we train LoomFormer on Cloud TPUs for large-scale training efficiency and run inference on GPUs for deployment convenience:
 
-- **[`jax/`](jax/)**: Standalone JAX/Flax training package built on unmodified [AI-Hypercomputer/maxtext (`maxtext-v0.2.0`)](https://github.com/AI-Hypercomputer/maxtext/releases/tag/maxtext-v0.2.0) as an external dependency, including both a concise pure-JAX reference implementation aligned with the paper's equations (`jax/loomformer/loom.py`) and custom fused forward/backward TPU Pallas kernels (`jax/loomformer/loom_pallas.py`). See [`jax/README.md`](jax/README.md).
+- **[`jax/`](jax/)**: Standalone JAX/Flax training package built on unmodified [AI-Hypercomputer/maxtext (`maxtext-v0.2.0`)](https://github.com/AI-Hypercomputer/maxtext/releases/tag/maxtext-v0.2.0) as an external dependency, cleanly separated into [`jax/loomformer/loomformer.py`](jax/loomformer/loomformer.py) (core `MShift`/`MRead`/`MWrite` primitives and Llama-backbone `LoomFormer` in a PyTorch-familiar `setup` + `__call__` layout), [`jax/loomformer/loompythia.py`](jax/loomformer/loompythia.py) (`LoomPythia`), and [`jax/loomformer/loom_pallas.py`](jax/loomformer/loom_pallas.py) (custom fused forward/backward TPU Pallas kernels). See [`jax/README.md`](jax/README.md).
 - **[`pytorch/`](pytorch/)**: HuggingFace-compatible PyTorch implementations (`loompythia/` and `loomformer/`), fused Triton inference kernels + CUDA-graph engine (`fast_inference/`), MaxText-to-HuggingFace checkpoint converter (`scripts/convert_maxtext_to_hf.py`), and test suite. See [`pytorch/README.md`](pytorch/README.md).
 
 ## Citation

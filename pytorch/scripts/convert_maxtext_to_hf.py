@@ -175,7 +175,7 @@ def _legacy_layer_map(writer: bool):
 
 
 def _refactored_layer_map(writer: bool):
-  """Mapping from refactored `jax/MaxText/layers/loom.py` parameter suffixes to `LoomPythiaDecoderLayer`."""
+  """Mapping from `jax/loomformer/loompythia.py` parameter suffixes to `LoomPythiaDecoderLayer`."""
   a, s = "loom_mha/", "loom_mha."
   m = [
       ("ln_1/scale", "ln_1.weight", None),
@@ -186,8 +186,8 @@ def _refactored_layer_map(writer: bool):
       ("ffn_x/wi/bias", "ffn_x.fc_in.bias", None),
       ("ffn_x/wo/kernel", "ffn_x.fc_out.weight", _linear),
       ("ffn_x/wo/bias", "ffn_x.fc_out.bias", None),
-      (a + "W_sg/kernel", s + "W_sg.weight", _linear),
-      (a + "b_sg", s + "W_sg.bias", None),
+      (a + "m_shift/W_sg/kernel", s + "W_sg.weight", _linear),
+      (a + "m_shift/b_sg", s + "W_sg.bias", None),
       (a + "W_q/kernel", s + "W_q.weight", _linear),
       (a + "W_q/bias", s + "W_q.bias", _flat),
       (a + "W_k/kernel", s + "W_k.weight", _linear),
@@ -195,35 +195,36 @@ def _refactored_layer_map(writer: bool):
       (a + "W_r1/kernel", s + "W_r1.weight", _linear),
       (a + "c_qk", s + "c_qk", None),
       (a + "c_vo", s + "c_vo", None),
-      (a + "qk_norm/q_norm/scale", s + "q_norm.weight", _plus_one),
-      (a + "qk_norm/k_norm/scale", s + "k_norm.weight", _plus_one),
+      (a + "q_norm_scale", s + "q_norm.weight", None),
+      (a + "k_norm_scale", s + "k_norm.weight", None),
       (a + "W_o/kernel", s + "W_o.weight", _out_proj),
       (a + "W_o/bias", s + "W_o.bias", None),
   ]
   for arm in ("q", "k", "v", "o"):
+    r = a + f"read_{arm}/"
     m += [
-        (a + f"W_r2_{arm}/kernel", s + f"W_r2_{arm}.weight", _linear),
-        (a + f"W_r2_{arm}/bias", s + f"W_r2_{arm}.bias", _flat),
-        (a + f"W_rg_{arm}/kernel", s + f"W_rg_{arm}.weight", _linear),
-        (a + f"b_rg_{arm}", s + f"W_rg_{arm}.bias", _flat),
-        (a + f"q_bar_{arm}", s + f"q_bar_{arm}", None),
-        (a + f"W_rg_bar_{arm}/kernel", s + f"W_rg_bar_{arm}.weight", _linear),
-        (a + f"b_rg_bar_{arm}", s + f"W_rg_bar_{arm}.bias", None),
+        (r + "W_r2/kernel", s + f"W_r2_{arm}.weight", _linear),
+        (r + "W_r2/bias", s + f"W_r2_{arm}.bias", _flat),
+        (r + "W_rg/kernel", s + f"W_rg_{arm}.weight", _linear),
+        (r + "b_rg", s + f"W_rg_{arm}.bias", _flat),
+        (r + "q_bar", s + f"q_bar_{arm}", None),
+        (r + "W_rg_bar/kernel", s + f"W_rg_bar_{arm}.weight", _linear),
+        (r + "b_rg_bar", s + f"W_rg_bar_{arm}.bias", None),
     ]
   if writer:
     m += [
         (a + "W_w1/kernel", s + "W_w1.weight", _linear),
-        (a + "W_w2/kernel", s + "W_w2.weight", _linear),
-        (a + "W_w2/bias", s + "W_w2.bias", _flat),
-        (a + "W_wg/kernel", s + "W_wg.weight", _linear),
-        (a + "b_wg", s + "W_wg.bias", None),
+        (a + "m_write/W_w2/kernel", s + "W_w2.weight", _linear),
+        (a + "m_write/W_w2/bias", s + "W_w2.bias", _flat),
+        (a + "m_write/W_wg/kernel", s + "W_wg.weight", _linear),
+        (a + "m_write/b_wg", s + "W_wg.bias", None),
         ("ffn_m/wi/kernel", "ffn_m.fc_in.weight", _linear),
         ("ffn_m/wo/kernel", "ffn_m.fc_out.weight", _linear),
         ("ffn_W_w1/kernel", "ffn_W_w1.weight", _linear),
-        ("ffn_W_w2/kernel", "ffn_W_w2.weight", _linear),
-        ("ffn_W_w2/bias", "ffn_W_w2.bias", _flat),
-        ("ffn_W_wg/kernel", "ffn_W_wg.weight", _linear),
-        ("ffn_b_wg", "ffn_W_wg.bias", None),
+        ("ffn_m_write/W_w2/kernel", "ffn_W_w2.weight", _linear),
+        ("ffn_m_write/W_w2/bias", "ffn_W_w2.bias", _flat),
+        ("ffn_m_write/W_wg/kernel", "ffn_W_wg.weight", _linear),
+        ("ffn_m_write/b_wg", "ffn_W_wg.bias", None),
     ]
   return m
 
@@ -233,7 +234,7 @@ def infer_loompythia_config(params: dict[str, np.ndarray], **kwargs) -> LoomPyth
     scanned = params["decoder/layers/ffn_x/wi/kernel"]
     D, n_scan, width = scanned.shape
     n, _, d, _ = params["decoder/layers/loom_mha/W_o/kernel"].shape
-    d_k = params["decoder/layers/loom_mha/b_sg"].shape[0]
+    d_k = params["decoder/layers/loom_mha/m_shift/b_sg"].shape[0]
     r_dim = params["decoder/layers/loom_mha/W_q/bias"].shape[-1]
     d_r = params["decoder/layers/loom_mha/W_r1/kernel"].shape[-1]
     last_width = params["decoder/last_layer/ffn_x/wi/kernel"].shape[-1]
@@ -282,10 +283,13 @@ def convert_params_to_state_dict(params: dict[str, np.ndarray], config: LoomPyth
     e = "decoder/embed_write/"
     put("model.embed_write.W_e.weight", _linear(get(e + "W_e/kernel")))
     put("model.embed_write.W_w1.weight", _linear(get(e + "W_w1/kernel")))
-    put("model.embed_write.W_w2.weight", _linear(get(e + "W_w2/kernel")))
-    put("model.embed_write.W_w2.bias", _flat(get(e + "W_w2/bias")))
-    put("model.embed_write.W_wg.weight", _linear(get(e + "W_wg/kernel")))
-    put("model.embed_write.W_wg.bias", get(e + "b_wg"))
+    put("model.embed_write.W_w2.weight", _linear(get(e + "m_write/W_w2/kernel")))
+    put("model.embed_write.W_w2.bias", _flat(get(e + "m_write/W_w2/bias")))
+    put("model.embed_write.W_wg.weight", _linear(get(e + "m_write/W_wg/kernel")))
+    put("model.embed_write.W_wg.bias", get(e + "m_write/b_wg"))
+    put("model.norm.weight", get("decoder/decoder_norm/scale"))
+    put("model.norm.bias", get("decoder/decoder_norm/bias"))
+    put("lm_head.weight", get("decoder/logits_dense/kernel").T)
   else:
     e = "decoder/embedding_bam_write/"
     put("model.embed_write.W_e.weight", _linear(get(e + "W_emb_u/kernel")))
@@ -294,10 +298,9 @@ def convert_params_to_state_dict(params: dict[str, np.ndarray], config: LoomPyth
     put("model.embed_write.W_w2.bias", _flat(get(e + "W_emb_v_up/bias")))
     put("model.embed_write.W_wg.weight", _linear(get(e + "W_emb_g/kernel")))
     put("model.embed_write.W_wg.bias", get(e + "emb_gw_b0"))
-
-  put("model.norm.weight", get("decoder/lm_head/decoder_norm/scale"))
-  put("model.norm.bias", get("decoder/lm_head/decoder_norm/bias"))
-  put("lm_head.weight", get("decoder/lm_head/logits_dense").T)
+    put("model.norm.weight", get("decoder/lm_head/decoder_norm/scale"))
+    put("model.norm.bias", get("decoder/lm_head/decoder_norm/bias"))
+    put("lm_head.weight", get("decoder/lm_head/logits_dense").T)
 
   last = config.num_hidden_layers - 1
   for i in range(config.num_hidden_layers):
