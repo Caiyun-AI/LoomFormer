@@ -68,6 +68,14 @@ print(tokenizer.decode(output_ids[0], skip_special_tokens=True))
 
 For maximum throughput, `pytorch/fast_inference` provides fused Triton kernels + static KV/$M$ caches compatible with `torch.compile` CUDA graphs (see [`pytorch/README.md`](pytorch/README.md)).
 
+## Mechanistic Analysis: Live Per-Token Circuit Rewiring
+
+Beyond benchmark gains, we trace how the trained 300B-token **`LoomPythia-2.8B`** rewires its internal circuits from token to token (Paper Section 5.3 & Appendix H). For example, at hub layer 19 on in-context country–capital prompts, country tokens (`"Spain"`, `"Germany"`) engage the same entity-storage circuit ($r = 0.92$), whereas stepping a single token to `":"` switches off entity broadcast ($-85\%$) and rewires onto causal $\tilde{q}$ queries and the $o^m$ local bypass ($r = 0.97$ across `":"` cues, $r = 0.31$ vs. adjacent `"Germany"`) to retrieve and output `" Berlin"` ($p = 0.65$):
+
+<p align="center">
+  <img src="assets/loompythia_icl_rewire.gif" width="96%" alt="Live Per-Token Circuit Rewiring in LoomPythia-2.8B"/>
+</p>
+
 ## Repository Structure
 
 In practice, we train LoomFormer on Cloud TPUs for large-scale training efficiency and run inference on GPUs for deployment convenience:
