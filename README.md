@@ -2,11 +2,12 @@
 
 This repository contains the official **JAX** training code and **PyTorch** (HuggingFace + Triton) inference code for our paper:
 
-> **Rewirable Circuits in Transformers with Loom Attention**  
+> **[Rewirable Circuits in Transformers with Loom Attention](https://arxiv.org/abs/2611.30634)**  
 > Da Xiao, Qingye Meng, Shengping Li, Xingyuan Yuan  
 > *Beijing University of Posts and Telecommunications & ColorfulClouds Technology*
 
 <p align="center">
+  📄 <a href="https://arxiv.org/abs/2611.30634"><b>Paper (arXiv:2611.30634)</b></a> &nbsp;|&nbsp;
   🤗 <a href="https://huggingface.co/Caiyun-AI/LoomPythia-2.8B"><b>LoomPythia-2.8B</b></a> &nbsp;|&nbsp;
   🤗 <a href="https://huggingface.co/Caiyun-AI/mHC-Pythia-2.8B"><b>mHC-Pythia-2.8B</b></a>
 </p>
@@ -78,6 +79,7 @@ If you find LoomFormer useful in your research, please cite:
 @article{xiao2026loomformer,
   title={Rewirable Circuits in Transformers with Loom Attention},
   author={Xiao, Da and Meng, Qingye and Li, Shengping and Yuan, Xingyuan},
+  journal={arXiv preprint arXiv:2611.30634},
   year={2026}
 }
 ```
