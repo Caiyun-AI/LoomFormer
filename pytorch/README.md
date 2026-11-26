@@ -60,7 +60,13 @@ pytorch/
 
 ## 1. PyTorch Pretraining (LoomFormer vs. Matched Llama)
 
-`train_loom.py` trains parameter-matched **LoomFormer** (`--loom`) and standard **Llama** (`--no-loom`) models on FineWeb10B binary shards from `[KellerJordan/modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt)` (`kjj0/fineweb10B-gpt2`), which are downloaded automatically on rank 0.
+`train_loom.py` trains parameter-matched **LoomFormer** (`--loom`) and standard **Llama** (`--no-loom`) models on GPT-2 tokenized FineWeb10B binary shards from [KellerJordan/modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt) ([`kjj0/fineweb10B-gpt2`](https://huggingface.co/datasets/kjj0/fineweb10B-gpt2)).
+
+**Data download:** Shards (~200 MB / 100M tokens each; `--num-train-shards 20` ≈ 4.2 GB including val) are downloaded automatically on rank 0 into `pytorch/data/fineweb10B` (override with `--data-dir`). On slow connections or large shard counts, you can pre-download ahead of `torchrun` (set `HF_ENDPOINT` if using a mirror) to avoid multi-GPU NCCL barrier timeouts, then pass `--skip-download`:
+
+```bash
+python -c "import sys; sys.path.insert(0, 'pytorch'); from training.data import download_fineweb10b_shards; download_fineweb10b_shards('pytorch/data/fineweb10B', num_train_shards=20)"
+```
 
 ### Built-in Model Presets (`--preset`)
 
@@ -99,7 +105,7 @@ python pytorch/plot_curves.py \
   --x-axis tokens --out pytorch/runs/compare_162m_2b.png
 ```
 
-*(On a single GPU, run* `python pytorch/train_loom.py ...` *with the same* `--batch-size`*; gradient accumulation is computed automatically from* `batch_size // (micro_batch_size * world_size)`*.)*
+*(On a single GPU, run `python pytorch/train_loom.py ...` with the same `--batch-size`; gradient accumulation is computed automatically from `batch_size // (micro_batch_size * world_size)`.)*
 
 After training completes, `--verify-inference` (enabled by default) converts the trained weights to BF16, builds `fast_inference.build(hf_model)`, and checks end-to-end KL alignment across the Triton training engine (`build_train_model`), pure PyTorch HuggingFace reference (`LoomFormerForCausalLM`), and `fast_inference` prefill + autoregressive decode.
 
