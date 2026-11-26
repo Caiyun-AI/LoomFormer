@@ -7,7 +7,8 @@ This repository contains the official **JAX** training code and **PyTorch** (Hug
 > *Beijing University of Posts and Telecommunications & ColorfulClouds Technology*
 
 <p align="center">
-  📄 <a href="https://arxiv.org/abs/2611.30634"><b>Paper (arXiv:2611.30634)</b></a> &nbsp;|&nbsp;
+  📄 <a href="https://arxiv.org/abs/2611.30634"><b>arXiv (2611.30634)</b></a> &nbsp;|&nbsp;
+  🤗 <a href="https://huggingface.co/papers/2611.30634"><b>HF Paper</b></a> &nbsp;|&nbsp;
   🤗 <a href="https://huggingface.co/Caiyun-AI/LoomPythia-2.8B"><b>LoomPythia-2.8B</b></a> &nbsp;|&nbsp;
   🤗 <a href="https://huggingface.co/Caiyun-AI/mHC-Pythia-2.8B"><b>mHC-Pythia-2.8B</b></a>
 </p>
