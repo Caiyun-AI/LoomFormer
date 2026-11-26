@@ -32,7 +32,11 @@ class LoomFormerConfig(PretrainedConfig):
       read_key_eps: float = 1e-4,
       read_key_scale: float = 0.1,
       write_eps: float = 1e-6,
+      read_gate_init: float = 0.05,
       static_read_gate_init: float = 0.99,
+      write_gate_init: float = 0.1,
+      m_shift_init: float = 0.5,
+      clone_vo_init: bool = True,
       embed_write_divisor: float = 0.0018161707314488303,
       ffn_write_divisor: float = 1.0,
       situ_beta1: float = 0.0,
@@ -64,7 +68,11 @@ class LoomFormerConfig(PretrainedConfig):
     self.read_key_eps = read_key_eps
     self.read_key_scale = read_key_scale
     self.write_eps = write_eps
+    self.read_gate_init = read_gate_init
     self.static_read_gate_init = static_read_gate_init
+    self.write_gate_init = write_gate_init
+    self.m_shift_init = m_shift_init
+    self.clone_vo_init = clone_vo_init
     self.embed_write_divisor = embed_write_divisor
     self.ffn_write_divisor = ffn_write_divisor
     self.situ_beta1 = situ_beta1

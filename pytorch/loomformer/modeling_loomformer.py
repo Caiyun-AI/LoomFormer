@@ -44,6 +44,8 @@ class RMSNorm(nn.Module):
     self.eps = eps
 
   def forward(self, x: torch.Tensor) -> torch.Tensor:
+    if x.is_cuda and hasattr(F, "rms_norm"):
+      return F.rms_norm(x, (x.shape[-1],), self.weight.to(x.dtype), self.eps)
     return rms_norm_unit(x, self.eps) * self.weight.to(x.dtype)
 
 
@@ -175,7 +177,7 @@ class LoomMHA(nn.Module):
     self.c_vo = nn.Parameter(torch.ones(1))
     self.rotary = RotaryEmbedding(r_dim, config.rope_min_timescale, config.rope_max_timescale)
     self.W_o = nn.Linear(n * d, D, bias=False)
-    self.logit_scale = math.sqrt(config.head_dim)
+    self.logit_scale = math.sqrt(d)
 
     self.write_M = config.has_write(layer_idx)
     if self.write_M:
@@ -276,6 +278,29 @@ class LoomFormerDecoderLayer(nn.Module):
     return x + self.ffn_x(h), M
 
 
+def _logit(p: float) -> float:
+  return math.log(p / (1.0 - p))
+
+
+class _BF16LinearFP32Out(torch.autograd.Function):
+  """Lossless FP32 logit accumulation with BF16 operands in forward & backward (matches JAX `bf16_dot_fp32_output`)."""
+
+  @staticmethod
+  def forward(ctx, hidden: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    ctx.save_for_backward(hidden, weight)
+    flat = hidden.reshape(-1, hidden.shape[-1])
+    return torch.mm(flat, weight.t(), out_dtype=torch.float32).view(*hidden.shape[:-1], weight.shape[0])
+
+  @staticmethod
+  def backward(ctx, grad_out: torch.Tensor):
+    hidden, weight = ctx.saved_tensors
+    g = grad_out.to(hidden.dtype).reshape(-1, weight.shape[0])
+    flat = hidden.reshape(-1, hidden.shape[-1])
+    dh = torch.mm(g, weight).view_as(hidden)
+    dw = torch.mm(g.t(), flat)
+    return dh, dw
+
+
 class LoomFormerPreTrainedModel(PreTrainedModel):
   config_class = LoomFormerConfig
   base_model_prefix = "model"
@@ -284,10 +309,57 @@ class LoomFormerPreTrainedModel(PreTrainedModel):
   supports_gradient_checkpointing = False
 
   def _init_weights(self, module):
+    cfg = self.config
+
+    def _skip(p: torch.Tensor) -> bool:
+      return bool(getattr(p, "_is_hf_initialized", False))
+
     if isinstance(module, (nn.Linear, nn.Embedding)):
-      module.weight.data.normal_(0.0, self.config.initializer_range)
-      if getattr(module, "bias", None) is not None:
+      if not _skip(module.weight):
+        module.weight.data.normal_(0.0, cfg.initializer_range)
+      if getattr(module, "bias", None) is not None and not _skip(module.bias):
         module.bias.data.zero_()
+    elif isinstance(module, RMSNorm):
+      if not _skip(module.weight):
+        module.weight.data.fill_(1.0)
+    elif isinstance(module, LoomEmbedWrite):
+      if not _skip(module.W_wg.bias):
+        module.W_wg.bias.data.fill_(_logit(cfg.write_gate_init))
+    elif isinstance(module, LoomMHA):
+      if not _skip(module.W_sg.weight):
+        module.W_sg.weight.data.zero_()
+      if not _skip(module.W_sg.bias):
+        module.W_sg.bias.data.fill_(_logit(cfg.m_shift_init))
+      read_bias = _logit(cfg.read_gate_init)
+      stat_bias = math.log(cfg.static_read_gate_init / (1.1 - cfg.static_read_gate_init))
+      for arm in ("q", "k", "o", "v"):
+        rg = getattr(module, f"W_rg_{arm}")
+        rg_bar = getattr(module, f"W_rg_bar_{arm}")
+        if not _skip(rg.weight):
+          rg.weight.data.zero_()
+        if not _skip(rg.bias):
+          rg.bias.data.fill_(read_bias)
+        if not _skip(rg_bar.weight):
+          rg_bar.weight.data.zero_()
+        if not _skip(rg_bar.bias):
+          rg_bar.bias.data.fill_(stat_bias)
+        q_bar = getattr(module, f"q_bar_{arm}")
+        if not _skip(q_bar):
+          if arm == "v":
+            q_bar.data.normal_(0.0, cfg.d_k ** -0.5)
+          else:
+            q_bar.data.zero_()
+      if cfg.clone_vo_init and not _skip(module.W_r2_v.weight):
+        module.W_r2_v.weight.data.copy_(module.W_r2_o.weight.data)
+      if not _skip(module.c_qk):
+        module.c_qk.data.fill_(1.0)
+      if not _skip(module.c_vo):
+        module.c_vo.data.fill_(1.0)
+      if module.write_M and not _skip(module.W_wg.bias):
+        module.W_wg.bias.data.fill_(_logit(cfg.write_gate_init))
+    elif isinstance(module, LoomFormerDecoderLayer):
+      if module.write_M and not _skip(module.ffn_W_wg.bias):
+        module.ffn_W_wg.bias.data.fill_(_logit(cfg.write_gate_init))
 
 
 class LoomFormerModel(LoomFormerPreTrainedModel):
@@ -322,6 +394,8 @@ class LoomFormerModel(LoomFormerPreTrainedModel):
     use_cache = self.config.use_cache if use_cache is None else use_cache
     loom_on = self.config.loom_enabled
     x = self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
+    if x.is_cuda and torch.is_autocast_enabled("cuda"):
+      x = x.to(torch.get_autocast_dtype("cuda"))
     b, t = x.shape[:2]
     if use_cache and past_key_values is None:
       past_key_values = DynamicCache()
@@ -401,8 +475,11 @@ class LoomFormerForCausalLM(LoomFormerPreTrainedModel, GenerationMixin):
     w = self.lm_head.weight
     if hidden.dtype == torch.float32 or not hidden.is_cuda:
       return F.linear(hidden.float(), w.float())
+    w_cast = w.to(hidden.dtype)
+    if torch.is_grad_enabled() and (hidden.requires_grad or w_cast.requires_grad):
+      return _BF16LinearFP32Out.apply(hidden, w_cast)
     flat = hidden.reshape(-1, hidden.shape[-1])
-    return torch.mm(flat, w.t(), out_dtype=torch.float32).view(*hidden.shape[:-1], -1)
+    return torch.mm(flat, w_cast.t(), out_dtype=torch.float32).view(*hidden.shape[:-1], -1)
 
   def forward(
       self,

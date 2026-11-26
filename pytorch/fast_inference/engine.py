@@ -640,8 +640,8 @@ class FastLoomFormer(_LlamaBase):
     self.register_buffer("rope_cos", cos, persistent=False)
     self.register_buffer("rope_sin", sin, persistent=False)
 
-    # Generic Triton kernel requires head_dim > 64 and BF16
-    self.kernels = USE_KERNELS and self.embed.dtype == torch.bfloat16 and self.kd > 64
+    # Generic Triton kernel requires head_dim >= 64 and BF16
+    self.kernels = USE_KERNELS and self.embed.dtype == torch.bfloat16 and self.kd >= 64
 
     self.layers = nn.ModuleList()
     for layer in m.layers:

@@ -28,28 +28,41 @@ def _pow2(x):
 
 
 def _vsplit(v):
-  """V columns as V0 + V1 tiles (powers of two >= 16, V1 masked; 0 = absent): 40 -> 32 + 16, 32 -> 32."""
-  v0 = 1 << (v.bit_length() - 1)
-  if v <= 16 or v0 == v:
+  """V columns as V0 + V1 tiles (powers of two >= 16, V1 masked; 0 = absent): 24 -> 32, 32 -> 32, 40 -> 32 + 16."""
+  if v <= 32:
     return _pow2(v), 0
+  v0 = 1 << (v.bit_length() - 1)
+  if v0 == v:
+    return v0, 0
   return v0, _pow2(v - v0)
+
+
+def _ksplit(k):
+  """Tail power-of-two width for K > 64 (placeholder 16 when K <= 64, dead-code-eliminated by `if K > 64:`)."""
+  return _pow2(max(1, k - 64))
 
 
 @triton.jit
 def _load_m(P, K: tl.constexpr, K1P: tl.constexpr, V: tl.constexpr, V0: tl.constexpr, V1: tl.constexpr):
-  """M tiles (k 64 + K1P) x (v V0 + V1) of one token; V1 == 0: the v1 tiles are zero placeholders."""
+  """M tiles (k 64 + K1P) x (v V0 + V1) of one token; K == 64 / V1 == 0 use zero placeholders."""
   k0 = tl.arange(0, 64)
-  k1 = 64 + tl.arange(0, K1P)
-  km = (k1 < K)[:, None]
   a = tl.arange(0, V0)
   am = (a < V)[None, :]
   m00 = tl.load(P + k0[:, None] * V + a[None, :], mask=am, other=0.)
-  m10 = tl.load(P + k1[:, None] * V + a[None, :], mask=km & am, other=0.)
+  if K > 64:
+    k1 = 64 + tl.arange(0, K1P)
+    km = (k1 < K)[:, None]
+    m10 = tl.load(P + k1[:, None] * V + a[None, :], mask=km & am, other=0.)
+  else:
+    m10 = tl.zeros((K1P, V0), P.dtype.element_ty)
   if V1 > 0:
     b = V0 + tl.arange(0, V1)
     bm = (b < V)[None, :]
     m01 = tl.load(P + k0[:, None] * V + b[None, :], mask=bm, other=0.)
-    m11 = tl.load(P + k1[:, None] * V + b[None, :], mask=km & bm, other=0.)
+    if K > 64:
+      m11 = tl.load(P + k1[:, None] * V + b[None, :], mask=km & bm, other=0.)
+    else:
+      m11 = tl.zeros((K1P, V1), P.dtype.element_ty)
   else:
     m01 = tl.zeros((64, 16), P.dtype.element_ty)
     m11 = tl.zeros((K1P, 16), P.dtype.element_ty)
@@ -60,17 +73,19 @@ def _load_m(P, K: tl.constexpr, K1P: tl.constexpr, V: tl.constexpr, V0: tl.const
 def _store_m(P, m00, m01, m10, m11, K: tl.constexpr, K1P: tl.constexpr, V: tl.constexpr, V0: tl.constexpr,
              V1: tl.constexpr):
   k0 = tl.arange(0, 64)
-  k1 = 64 + tl.arange(0, K1P)
-  km = (k1 < K)[:, None]
   a = tl.arange(0, V0)
   am = (a < V)[None, :]
   tl.store(P + k0[:, None] * V + a[None, :], m00, mask=am)
-  tl.store(P + k1[:, None] * V + a[None, :], m10, mask=km & am)
+  if K > 64:
+    k1 = 64 + tl.arange(0, K1P)
+    km = (k1 < K)[:, None]
+    tl.store(P + k1[:, None] * V + a[None, :], m10, mask=km & am)
   if V1 > 0:
     b = V0 + tl.arange(0, V1)
     bm = (b < V)[None, :]
     tl.store(P + k0[:, None] * V + b[None, :], m01, mask=bm)
-    tl.store(P + k1[:, None] * V + b[None, :], m11, mask=km & bm)
+    if K > 64:
+      tl.store(P + k1[:, None] * V + b[None, :], m11, mask=km & bm)
 
 
 @triton.jit
@@ -81,21 +96,27 @@ def _write_pair(row, C, s_c, CB, s_cb, h_cb, G, s_g, GB, A, s_a, write_eps, HAS_
   n = tl.arange(0, NP)
   nm = n < N
   k0 = tl.arange(0, 64)
-  k1 = 64 + tl.arange(0, K1P)
   c0 = tl.load(C + row * s_c + n[:, None] * K + k0[None, :], mask=nm[:, None], other=0.).to(tl.float32)
-  c1 = tl.load(C + row * s_c + n[:, None] * K + k1[None, :], mask=nm[:, None] & (k1 < K)[None, :],
-               other=0.).to(tl.float32)
+  if K > 64:
+    k1 = 64 + tl.arange(0, K1P)
+    c1 = tl.load(C + row * s_c + n[:, None] * K + k1[None, :], mask=nm[:, None] & (k1 < K)[None, :],
+                 other=0.).to(tl.float32)
   if HAS_CB:     # content = C + CB (attention output + local O, the o_head sum rounded as materialized)
     c0 = (c0 + tl.load(CB + row * s_cb + n[:, None] * h_cb + k0[None, :], mask=nm[:, None],
                        other=0.).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
-    c1 = (c1 + tl.load(CB + row * s_cb + n[:, None] * h_cb + k1[None, :], mask=nm[:, None] & (k1 < K)[None, :],
-                       other=0.).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
+    if K > 64:
+      c1 = (c1 + tl.load(CB + row * s_cb + n[:, None] * h_cb + k1[None, :], mask=nm[:, None] & (k1 < K)[None, :],
+                         other=0.).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
   sc = tl.sigmoid(tl.load(G + row * s_g + n, mask=nm, other=0.).to(tl.float32) +
                   tl.load(GB + n, mask=nm, other=0.).to(tl.float32))
   if RMS_C:
-    sc = sc * tl.rsqrt((tl.sum(c0 * c0, 1) + tl.sum(c1 * c1, 1)) / K + write_eps)
+    ss_c = tl.sum(c0 * c0, 1)
+    if K > 64:
+      ss_c += tl.sum(c1 * c1, 1)
+    sc = sc * tl.rsqrt(ss_c / K + write_eps)
   c0 = (c0 * sc[:, None]).to(tl.bfloat16)
-  c1 = (c1 * sc[:, None]).to(tl.bfloat16)
+  if K > 64:
+    c1 = (c1 * sc[:, None]).to(tl.bfloat16)
   a = tl.arange(0, V0)
   a0 = tl.load(A + row * s_a + n[:, None] * V + a[None, :], mask=nm[:, None] & (a < V)[None, :],
                other=0.).to(tl.float32)
@@ -107,14 +128,16 @@ def _write_pair(row, C, s_c, CB, s_cb, h_cb, G, s_g, GB, A, s_a, write_eps, HAS_
     ss += tl.sum(a1 * a1, 1)
   rr = tl.rsqrt(ss / V + write_eps)[:, None]
   a0 = (a0 * rr).to(tl.bfloat16)
+  d00 = tl.dot(tl.trans(c0), a0)
+  d10 = tl.dot(tl.trans(c1), a0) if K > 64 else tl.zeros((K1P, V0), tl.float32)
   if V1 > 0:
     a1 = (a1 * rr).to(tl.bfloat16)
     d01 = tl.dot(tl.trans(c0), a1)
-    d11 = tl.dot(tl.trans(c1), a1)
+    d11 = tl.dot(tl.trans(c1), a1) if K > 64 else tl.zeros((K1P, V1), tl.float32)
   else:
     d01 = tl.zeros((64, 16), tl.float32)
     d11 = tl.zeros((K1P, 16), tl.float32)
-  return tl.dot(tl.trans(c0), a0), d01, tl.dot(tl.trans(c1), a0), d11
+  return d00, d01, d10, d11
 
 
 @triton.jit
@@ -128,10 +151,12 @@ def _new_m(row, MOLD, s_mo, C1, s_c1, C1B, s_c1b, h_c1b, G1, s_g1, A1, s_a1, C2,
   e00, e01, e10, e11 = _write_pair(row, C2, s_c2, C2, 0, 0, G2, s_g2, WB + N, A2, s_a2, write_eps, False,
                                    False, N, NP, K, K1P, V, V0, V1)
   m00 = (m00.to(tl.float32) + (d00 + e00)).to(tl.bfloat16)
-  m10 = (m10.to(tl.float32) + (d10 + e10)).to(tl.bfloat16)
+  if K > 64:
+    m10 = (m10.to(tl.float32) + (d10 + e10)).to(tl.bfloat16)
   if V1 > 0:
     m01 = (m01.to(tl.float32) + (d01 + e01)).to(tl.bfloat16)
-    m11 = (m11.to(tl.float32) + (d11 + e11)).to(tl.bfloat16)
+    if K > 64:
+      m11 = (m11.to(tl.float32) + (d11 + e11)).to(tl.bfloat16)
   return m00, m01, m10, m11
 
 
@@ -168,26 +193,30 @@ def _group_keys(group, row, c, cm, UP, s_up, GATES, s_gt, GB, SKEY, key_eps, key
 @triton.jit
 def _group_read(group, row, seq, pos, c, cm, r0, r1, f00, f01, f10, f11, inv, STD, s_std, COS, SIN,
                 QK, s_qk, VO, s_vo, KC, skb, skh, sks, VC, svb, svh, svs, qk_scale, vo_scale, q_mult,
-                CACHE: tl.constexpr, N: tl.constexpr, K: tl.constexpr, K1P: tl.constexpr, V1: tl.constexpr,
-                H: tl.constexpr, HP: tl.constexpr, QW: tl.constexpr, VW: tl.constexpr, CRP: tl.constexpr):
+                CACHE: tl.constexpr, N: tl.constexpr, K: tl.constexpr, K1P: tl.constexpr,
+                V1: tl.constexpr, H: tl.constexpr, HP: tl.constexpr, QW: tl.constexpr, VW: tl.constexpr,
+                CRP: tl.constexpr):
   """Rows c (of the group's 2N (arm, head) rows) of arm group 0 (q, k) or 1 (v, local o) for one token,
   from its read keys, the bf16 read view tiles and its inverse RMS."""
   k0 = tl.arange(0, 64)
-  k1 = 64 + tl.arange(0, K1P)
-  km1 = k1 < K
   o0 = tl.dot(r0, tl.trans(f00))          # [CRP, 64]
-  o1 = tl.dot(r0, tl.trans(f10))          # [CRP, K1P]
+  if K > 64:
+    k1 = 64 + tl.arange(0, K1P)
+    km1 = k1 < K
+    o1 = tl.dot(r0, tl.trans(f10))        # [CRP, K1P]
   if V1 > 0:
     o0 += tl.dot(r1, tl.trans(f01))
-    o1 += tl.dot(r1, tl.trans(f11))
+    if K > 64:
+      o1 += tl.dot(r1, tl.trans(f11))
   head = c % N
   sm = cm[:, None]
-  if group == 0:     # q, k: [c_qk read | std] with the RoPE tail, q scaled
+  if group == 0:     # q, k: [c_qk read | std] with optional RoPE tail, q scaled
     arm = c // N
     qm = tl.where(arm == 0, q_mult, 1.0)
     sq = inv * qk_scale * qm
     y0 = (o0 * sq[:, None]).to(tl.bfloat16)
-    y1 = (o1 * sq[:, None]).to(tl.bfloat16)
+    if K > 64:
+      y1 = (o1 * sq[:, None]).to(tl.bfloat16)
     j = tl.arange(0, HP)
     jm = j < H
     sa = tl.load(STD + row * s_std + c[:, None] * (2 * H) + j[None, :], mask=sm & jm[None, :],
@@ -200,7 +229,8 @@ def _group_read(group, row, seq, pos, c, cm, r0, r1, f00, f01, f10, f11, inv, ST
     rb = ((sb * cs[None, :] + sa * sn[None, :]) * qm[:, None]).to(tl.bfloat16)
     base = QK + row * s_qk + c[:, None] * QW
     tl.store(base + k0[None, :], y0, mask=sm)
-    tl.store(base + k1[None, :], y1, mask=sm & km1[None, :])
+    if K > 64:
+      tl.store(base + k1[None, :], y1, mask=sm & km1[None, :])
     tl.store(base + K + j[None, :], ra, mask=sm & jm[None, :])
     tl.store(base + K + H + j[None, :], rb, mask=sm & jm[None, :])
     if QW > K + 2 * H:     # zero padding (prefill attention reads QW columns)
@@ -211,21 +241,24 @@ def _group_read(group, row, seq, pos, c, cm, r0, r1, f00, f01, f10, f11, inv, ST
       kmask = sm & (arm == 1)[:, None]
       kb = KC + seq * skb + head[:, None] * skh + pos * sks
       tl.store(kb + k0[None, :], y0, mask=kmask)
-      tl.store(kb + k1[None, :], y1, mask=kmask & km1[None, :])
+      if K > 64:
+        tl.store(kb + k1[None, :], y1, mask=kmask & km1[None, :])
       tl.store(kb + K + j[None, :], ra, mask=kmask & jm[None, :])
       tl.store(kb + K + H + j[None, :], rb, mask=kmask & jm[None, :])
   else:              # v, local o
     sv = inv * vo_scale
     y0 = (o0 * sv).to(tl.bfloat16)
-    y1 = (o1 * sv).to(tl.bfloat16)
     base = VO + row * s_vo + c[:, None] * VW
     tl.store(base + k0[None, :], y0, mask=sm)
-    tl.store(base + k1[None, :], y1, mask=sm & (k1 < VW)[None, :])     # columns K..VW-1 are zero
+    if K > 64:
+      y1 = (o1 * sv).to(tl.bfloat16)
+      tl.store(base + k1[None, :], y1, mask=sm & (k1 < VW)[None, :])     # columns K..VW-1 are zero
     if CACHE:      # the value rows go to the value cache
       vmask = sm & (c < N)[:, None]
       vb = VC + seq * svb + head[:, None] * svh + pos * svs
       tl.store(vb + k0[None, :], y0, mask=vmask)
-      tl.store(vb + k1[None, :], y1, mask=vmask & km1[None, :])
+      if K > 64:
+        tl.store(vb + k1[None, :], y1, mask=vmask & km1[None, :])
 
 
 @triton.jit
@@ -235,7 +268,8 @@ def _read_kernel(
     SHIFT, s_sh, STD, s_std, UP, s_up, GATES, s_gt, XB, WB, SKEY, COS, SIN,
     QK, s_qk, VO, s_vo, KC, skb, skh, sks, VC, svb, svh, svs,
     T, eps, key_eps, key_scale, static_scale, qk_scale, vo_scale, q_mult,
-    HAS_PREV: tl.constexpr, FUSE_WRITE: tl.constexpr, HAS_CB: tl.constexpr, CACHE: tl.constexpr, SUB: tl.constexpr, GROUPS: tl.constexpr,
+    HAS_PREV: tl.constexpr, FUSE_WRITE: tl.constexpr, HAS_CB: tl.constexpr, CACHE: tl.constexpr,
+    SUB: tl.constexpr, GROUPS: tl.constexpr,
     N: tl.constexpr, NP: tl.constexpr, K: tl.constexpr, K1P: tl.constexpr, V: tl.constexpr, V0: tl.constexpr,
     V1: tl.constexpr, H: tl.constexpr, HP: tl.constexpr, QW: tl.constexpr, VW: tl.constexpr, CR: tl.constexpr,
     CRP: tl.constexpr):
@@ -283,29 +317,39 @@ def _read_kernel(
   else:
     m00, m01, m10, m11 = _load_m(M + row * s_m, K, K1P, V, V0, V1)
   f00 = m00.to(tl.float32)
-  f10 = m10.to(tl.float32)
   f00 = (f00 + s0 * (p00.to(tl.float32) - f00)).to(tl.bfloat16).to(tl.float32)
-  f10 = (f10 + s0 * (p10.to(tl.float32) - f10)).to(tl.bfloat16).to(tl.float32)
-  f01 = m01.to(tl.float32)
-  f11 = m11.to(tl.float32)
+  ss = tl.sum(tl.sum(f00 * f00, 1), 0)
+  if K > 64:
+    f10 = m10.to(tl.float32)
+    f10 = (f10 + s0 * (p10.to(tl.float32) - f10)).to(tl.bfloat16).to(tl.float32)
+    ss += tl.sum(tl.sum(f10 * f10, 1), 0)
+    fb10 = f10.to(tl.bfloat16)
+  else:
+    fb10 = tl.zeros((K1P, V0), tl.bfloat16)
   if V1 > 0:
+    f01 = m01.to(tl.float32)
     f01 = (f01 + s1 * (p01.to(tl.float32) - f01)).to(tl.bfloat16).to(tl.float32)
-    f11 = (f11 + s1 * (p11.to(tl.float32) - f11)).to(tl.bfloat16).to(tl.float32)
-  ss = tl.sum(tl.sum(f00 * f00, 1), 0) + tl.sum(tl.sum(f10 * f10, 1), 0)
-  if V1 > 0:
-    ss += tl.sum(tl.sum(f01 * f01, 1), 0) + tl.sum(tl.sum(f11 * f11, 1), 0)
+    ss += tl.sum(tl.sum(f01 * f01, 1), 0)
+    fb01 = f01.to(tl.bfloat16)
+    if K > 64:
+      f11 = m11.to(tl.float32)
+      f11 = (f11 + s1 * (p11.to(tl.float32) - f11)).to(tl.bfloat16).to(tl.float32)
+      ss += tl.sum(tl.sum(f11 * f11, 1), 0)
+      fb11 = f11.to(tl.bfloat16)
+    else:
+      fb11 = tl.zeros((K1P, V1), tl.bfloat16)
+  else:
+    fb01 = tl.zeros((64, 16), tl.bfloat16)
+    fb11 = tl.zeros((K1P, 16), tl.bfloat16)
   inv = tl.rsqrt(ss / (K * V) + eps)
   fb00 = f00.to(tl.bfloat16)
-  fb01 = f01.to(tl.bfloat16)
-  fb10 = f10.to(tl.bfloat16)
-  fb11 = f11.to(tl.bfloat16)
   _group_read(g0, row, seq, pos, c, cm, ra0, ra1, fb00, fb01, fb10, fb11, inv, STD, s_std, COS, SIN, QK, s_qk, VO,
-              s_vo, KC, skb, skh, sks, VC, svb, svh, svs, qk_scale, vo_scale, q_mult, CACHE, N, K, K1P, V1, H, HP, QW,
-              VW, CRP)
+              s_vo, KC, skb, skh, sks, VC, svb, svh, svs, qk_scale, vo_scale, q_mult, CACHE, N, K, K1P, V1,
+              H, HP, QW, VW, CRP)
   if GROUPS == 2:
     _group_read(g0 + 1, row, seq, pos, c, cm, rb0, rb1, fb00, fb01, fb10, fb11, inv, STD, s_std, COS, SIN, QK, s_qk,
-                VO, s_vo, KC, skb, skh, sks, VC, svb, svh, svs, qk_scale, vo_scale, q_mult, CACHE, N, K, K1P, V1, H,
-                HP, QW, VW, CRP)
+                VO, s_vo, KC, skb, skh, sks, VC, svb, svh, svs, qk_scale, vo_scale, q_mult, CACHE, N, K,
+                K1P, V1, H, HP, QW, VW, CRP)
 
 
 @triton.jit
@@ -336,7 +380,7 @@ def fused_read(m_old: torch.Tensor, c1: torch.Tensor, g1: torch.Tensor, a1: torc
                eps: float, key_eps: float, key_scale: float, static_scale: float, qk_scale: float, vo_scale: float,
                q_mult: float, sub: int, groups: int, warps: int, k_cache: Optional[torch.Tensor] = None,
                v_cache: Optional[torch.Tensor] = None, g1_off: int = 0, g2_off: int = 0, shift_off: int = 0,
-               std_off: int = 0, gates_off: int = 0, c1_vo: Optional[torch.Tensor] = None
+               std_off: int = 0,                gates_off: int = 0, c1_vo: Optional[torch.Tensor] = None,
                ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
   """Token rows r = b * T + t (2-D [rows, features], unit inner stride). Returns (m_new [rows, K*V]
   (empty when not has_write), qk [rows, 2, N, QW] (K + S used), vo [rows, 2, N, VW] (K used)); widths
@@ -365,7 +409,7 @@ def fused_read(m_old: torch.Tensor, c1: torch.Tensor, g1: torch.Tensor, a1: torc
   m_new = m_old.new_empty((rows if has_write else 0, k * v))
   dummy = m_old
   v0, v1 = _vsplit(v)
-  meta = dict(N=n, NP=_pow2(n), K=k, K1P=_pow2(k - 64), V=v, V0=v0, V1=v1)
+  meta = dict(N=n, NP=_pow2(n), K=k, K1P=_ksplit(k), V=v, V0=v0, V1=v1)
   fuse = has_write and t == 1
   if has_write and not fuse:     # prefill: a separate write pass (fused, the read kernel spills)
     _write_kernel[(rows,)](m_old, m_old.stride(0), m_new, c1, c1.stride(0), cb, *cbs, g1, g1.stride(0), a1, a1.stride(0),
@@ -390,7 +434,8 @@ def fused_read(m_old: torch.Tensor, c1: torch.Tensor, g1: torch.Tensor, a1: torc
       kc, kc.stride(0) if cache else 0, kc.stride(1) if cache else 0, kc.stride(2) if cache else 0,
       vc, vc.stride(0) if cache else 0, vc.stride(1) if cache else 0, vc.stride(2) if cache else 0,
       t, eps, key_eps, key_scale, static_scale, qk_scale, vo_scale, q_mult,
-      HAS_PREV=has_prev, FUSE_WRITE=fuse, HAS_CB=fuse and c1_vo is not None, CACHE=cache, SUB=sub, GROUPS=groups, H=s // 2, HP=_pow2(s // 2),
+      HAS_PREV=has_prev, FUSE_WRITE=fuse, HAS_CB=fuse and c1_vo is not None, CACHE=cache,
+      SUB=sub, GROUPS=groups, H=s // 2, HP=_pow2(s // 2),
       QW=qw, VW=_round8(k), CR=cr, CRP=_pow2(cr), **meta, num_warps=warps)
   return m_new, qk, vo
 
