@@ -2,7 +2,7 @@
 
 This directory provides HuggingFace-compatible PyTorch implementations of **LoomPythia** and **LoomFormer**, together with:
 
-1. **Fused Triton Training Engine & DDP Pretraining** (`training/engine.py`, `training/triton_ops.py`, `train_loom.py`): separates the fast Triton training wrapper (`build_train_model(hf_model, grad_checkpoint=False)`, mirroring `fast_inference/engine.py` with live HF parameters) from the pure HuggingFace reference in `loomformer/`, reusing `fast_inference/kernels_llama.py` with zero-spill autograd backward kernels, `torch.compile` (0 graph breaks), optional `--grad-checkpoint`, parameter-matched presets (`160m`, `medium`), and FineWeb10B scripts.
+1. **Fused Triton Training Engine & DDP Pretraining** (`training/engine.py`, `training/triton_ops.py`, `train_loom.py`, `configs/`): separates the fast Triton training wrapper (`build_train_model(hf_model, grad_checkpoint=False)`, mirroring `fast_inference/engine.py` with live HF parameters) from the pure HuggingFace reference in `loomformer/`, reusing `fast_inference/kernels_llama.py` with shape-adaptive Triton dispatch (`160m` → `2.8b`, zero-spill autograd backward kernels & precomputed-FB pipeline), FlashAttention-2 native head-dim bucketing, `torch.compile` (0 graph breaks), optional `--grad-checkpoint`, standalone YAML configs (`configs/loomformer_*.yml`), and FineWeb10B scripts.
 2. **Fused Triton + CUDA-Graph Fast Inference Engine** (`fast_inference/`): static KV/$M$ cache wrappers for high-throughput prefill and autoregressive decode.
 3. **MaxText-to-HuggingFace Converter** (`scripts/convert_maxtext_to_hf.py`): converts Orbax OCDBT MaxText checkpoints directly to standalone HuggingFace `safetensors` directories.
 
@@ -29,29 +29,15 @@ pip install -r requirements.txt
 
 ```text
 pytorch/
-├── loompythia/                  # HF LoomPythiaConfig & LoomPythiaForCausalLM (Pythia backbone + QKNorm)
-├── loomformer/
-│   ├── configuration_loomformer.py
-│   └── modeling_loomformer.py   # Pure HF LoomFormerForCausalLM reference (LoomLlama & matched Llama baselines)
-├── fast_inference/              # Fused Triton + CUDA-graph inference engine (`fast_inference.build(hf_model)`)
-│   ├── engine.py                # Static KV/M caches, prefill, and CUDA-graph decode wrappers
-│   ├── kernels_pythia.py        # Fused MWrite+MShift+MNorm+MRead+QKNorm+RoPE kernels (LoomPythia)
-│   ├── kernels_llama.py         # Fused MWrite+MShift+MNorm+MRead+RoPE kernels (LoomFormer / shared with training)
-│   ├── prefill_attention.py     # Strictly-causal (s < t) Triton FlashAttention + o_m bypass
-│   └── decode_attention.py      # CUDA-graph-safe split-KV flash-decoding
-├── training/
-│   ├── engine.py                # Fused Triton training engine (`build_train_model`, live HF params, optional `--grad-checkpoint`)
-│   ├── triton_ops.py            # Fused Triton fwd/bwd autograd ops (`loom_read_triton`, `loom_write_triton`) + FA2 SDPA
-│   ├── configs.py               # Parameter-matched presets: `160m` (162.2M), `medium` (432.1M)
-│   └── data.py                  # FineWeb10B (`kjj0/fineweb10B-gpt2`) shard downloader & DDP memmap loader
-├── train_loom.py                # Single-GPU / multi-GPU (`torchrun` DDP) training & alignment verification entrypoint
-├── plot_curves.py               # Plot train/val loss vs. tokens, steps, or wall-clock time
-├── scripts/
-│   ├── convert_maxtext_to_hf.py # MaxText Orbax OCDBT / .npz -> HuggingFace safetensors converter
-│   └── benchmark_inference.py   # Prefill & CUDA-graph decode latency benchmark
-└── tests/
-    ├── test_loom_pytorch.py     # KV+M cache, chunked prefill, left-padding, generate(), fast_inference parity
-    └── test_loom_training.py    # Triton fwd/bwd grad parity, torch.compile (0 breaks), training & inference alignment
+├── configs/           # Standalone YAML training configs (`160m`, `medium`, `large`, `xl`, `2.8b`)
+├── loompythia/        # HF LoomPythiaConfig & LoomPythiaForCausalLM (Pythia backbone + QKNorm)
+├── loomformer/        # Pure HF LoomFormerForCausalLM reference (LoomLlama & matched Llama baselines)
+├── fast_inference/    # Fused Triton + CUDA-graph prefill & decode engine (`fast_inference.build`)
+├── training/          # Shape-adaptive Triton training engine, autograd ops, presets & FineWeb10B loader
+├── scripts/           # MaxText-to-HF checkpoint converter & inference latency benchmark
+├── tests/             # Unit & integration tests (KV+M cache, Triton grad parity, torch.compile, alignment)
+├── train_loom.py      # Single-GPU / multi-GPU (`torchrun` DDP) training & alignment entrypoint
+└── plot_curves.py     # Plot train/val loss curves vs. tokens, steps, or wall-clock time
 ```
 
 ---
@@ -60,7 +46,7 @@ pytorch/
 
 ## 1. PyTorch Pretraining (LoomFormer vs. Matched Llama)
 
-`train_loom.py` trains parameter-matched **LoomFormer** (`--loom`) and standard **Llama** (`--no-loom`) models on GPT-2 tokenized FineWeb10B binary shards from [KellerJordan/modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt) ([`kjj0/fineweb10B-gpt2`](https://huggingface.co/datasets/kjj0/fineweb10B-gpt2)).
+`train_loom.py` trains parameter-matched **LoomFormer** (`--loom`) and standard **Llama** (`--no-loom`) models on GPT-2 tokenized FineWeb10B binary shards from [KellerJordan/modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt) (`[kjj0/fineweb10B-gpt2](https://huggingface.co/datasets/kjj0/fineweb10B-gpt2)`).
 
 **Data download:** Shards (~200 MB / 100M tokens each; `--num-train-shards 20` ≈ 4.2 GB including val) are downloaded automatically on rank 0 into `pytorch/data/fineweb10B` (override with `--data-dir`). On slow connections or large shard counts, you can pre-download ahead of `torchrun` (set `HF_ENDPOINT` if using a mirror) to avoid multi-GPU NCCL barrier timeouts, then pass `--skip-download`:
 
@@ -68,61 +54,60 @@ pytorch/
 python -c "import sys; sys.path.insert(0, 'pytorch'); from training.data import download_fineweb10b_shards; download_fineweb10b_shards('pytorch/data/fineweb10B', num_train_shards=20)"
 ```
 
-### Built-in Model Presets (`--preset`)
 
 
-| Preset   | Params (Loom / Llama) | Geometry (`D, L, n, d`) | Loom (`d_k, d_r, r`) | Notes                                |
-| -------- | --------------------- | ----------------------- | -------------------- | ------------------------------------ |
-| `160m`   | 162.22M / 162.22M     | `768, 12, 12, 64`       | `24, 128, 16`        | 2B-token FineWeb benchmark below     |
-| `medium` | 432.11M / 432.12M     | `1200, 18, 16, 75`      | `32, 256, 18`        | Paper Medium architecture (`T=4096`) |
+### Reproducing the Pretraining Experiments
 
-
-
-
-### Reproducing the FineWeb Pretraining Experiments
-
-The `160m` command below trains for **2B tokens** (`7630 steps × 256 seqs × 1024 tokens/seq`) on 8 GPUs using AdamW with cosine decay (`warmup_steps=150`, `min_lr_ratio=0.1`). Switch `--loom` to `--no-loom` to run the parameter-matched Llama baseline. Add `--grad-checkpoint` (optional, off by default) for full per-layer activation checkpointing matching JAX `remat_policy="full"`.
+Pass any YAML config via `--config` (any CLI flag overrides the YAML; pass `--no-loom` to automatically run the parameter-matched Llama baseline for that scale):
 
 ```bash
-# 162M (2B tokens, lr=1e-3) — replace `--loom` with `--no-loom` for Llama-162M
+# Train LoomFormer directly from its YAML config (replace with medium / large / xl / 2p8b as needed)
 torchrun --standalone --nproc_per_node=8 pytorch/train_loom.py \
-  --preset 160m --loom --compile \
-  --steps 7630 --batch-size 256 --micro-batch-size 32 --seq-len 1024 \
-  --lr 1e-3 --warmup-steps 150 --eval-every 500 --num-train-shards 20 \
-  --out-dir pytorch/runs/loomllama_162m_2b --save-ckpt
+  --config pytorch/configs/loomformer_160m.yml
 
-# Paper Medium 432M (`T=4096, B=128, micro_bs=16` with optional `--grad-checkpoint`)
+# Train the parameter-matched Llama baseline from the same YAML config (`--no-loom` switches FFN to matched Llama width)
 torchrun --standalone --nproc_per_node=8 pytorch/train_loom.py \
-  --preset medium --loom --compile --grad-checkpoint \
-  --steps 13500 --batch-size 128 --micro-batch-size 16 --seq-len 4096 \
-  --lr 3e-4 --warmup-steps 135 --eval-every 500 --num-train-shards 70 \
-  --out-dir pytorch/runs/loomformer_medium --save-ckpt
+  --config pytorch/configs/loomformer_160m.yml --no-loom \
+  --out-dir pytorch/runs/llama_162m_2b_seq4096_b128
+
+# Optional: override any YAML field on the CLI (e.g. FA2 HEADDIM=96 alignment on 2.8B via `--rope-dim 16`)
+torchrun --standalone --nproc_per_node=8 pytorch/train_loom.py \
+  --config pytorch/configs/loomformer_2p8b.yml --rope-dim 16
 
 # Plot comparison curves (by tokens, step, or wall-clock time)
 python pytorch/plot_curves.py \
-  --runs pytorch/runs/llama_162m_2b pytorch/runs/loomllama_162m_2b \
-  --labels "Llama-162M (162.22M)" "LoomLlama-162M (162.22M)" \
-  --x-axis tokens --out pytorch/runs/compare_162m_2b.png
+  --runs pytorch/runs/llama_162m_2b_seq4096_b128 pytorch/runs/loomllama_162m_2b_seq4096_b128 \
+  --labels "Llama-162M (162.22M, T=4096)" "LoomLlama-162M (162.22M, T=4096)" \
+  --x-axis tokens --out pytorch/runs/compare_162m_2b_seq4096_b128.png
 ```
 
-*(On a single GPU, run `python pytorch/train_loom.py ...` with the same `--batch-size`; gradient accumulation is computed automatically from `batch_size // (micro_batch_size * world_size)`.)*
+*(The default YAMLs target 8 GPUs and explicitly enforce* `batch_size == micro_batch_size * world_size * grad_accum`*. On a different GPU count—e.g. a single GPU—adjust* `--grad-accum` *or pass* `--grad-accum 0` *to auto-compute it.)*
 
 After training completes, `--verify-inference` (enabled by default) converts the trained weights to BF16, builds `fast_inference.build(hf_model)`, and checks end-to-end KL alignment across the Triton training engine (`build_train_model`), pure PyTorch HuggingFace reference (`LoomFormerForCausalLM`), and `fast_inference` prefill + autoregressive decode.
 
-### FineWeb 2B-Token Results & 8×A800 Training Throughput
+### 8×A800 Training Throughput & FineWeb 2B-Token Results
+
+Measured on `8×A800-80GB` (`seq_len=4096`, `batch_size=128`, `--compile`, `--grad-checkpoint`, BF16) with shape-adaptive Triton kernel dispatch (`_select_kernel_config` in `training/triton_ops.py`). Throughput and Peak Mem are reported relative to the parameter-matched Llama baseline (`100%`):
 
 
-| Preset & Setting (8×A800, `--compile`)                     | Model                 | Params  | Val Loss (2B tok) $\downarrow$ | Val PPL $\downarrow$ | Steady Throughput  | Relative Speed | Peak Mem |
-| ---------------------------------------------------------- | --------------------- | ------- | ------------------------------ | -------------------- | ------------------ | -------------- | -------- |
-| `160m` (`T=1024, B=256, micro_bs=32`)                      | Llama-162M            | 162.22M | 3.4243                         | 30.70                | 1,592.6k tok/s     | 100.0%         | 19.69 GB |
-| `160m` (`T=1024, B=256, micro_bs=32`)                      | **LoomLlama-162M**    | 162.22M | **3.2868** (−0.138)            | **26.76**            | **1,205.8k tok/s** | **75.7%**      | 24.56 GB |
-| `medium` (`T=4096, B=128, micro_bs=16, --grad-checkpoint`) | Llama-Medium          | 432.12M | —                              | —                    | 368.7k tok/s       | 100.0%         | 22.57 GB |
-| `medium` (`T=4096, B=128, micro_bs=16, --grad-checkpoint`) | **LoomFormer-Medium** | 432.11M | —                              | —                    | **323.8k tok/s**   | **87.8%**      | 28.67 GB |
+| Model                                            | Params  | FA2 Bucket (`Llama → Loom`) | Throughput (`vs. Llama`) | Peak Mem (`vs. Llama`) |
+| ------------------------------------------------ | ------- | --------------------------- | ------------------------ | ---------------------- |
+| **LoomLlama-162M**                               | 162.22M | `64 → 96`                   | **76.0%**                | 107.6%                 |
+| **LoomLlama-162M*** (`n=16, d=48, r=16`)         | 162.20M | `64 → 64`                   | **77.8%**                | 106.1%                 |
+| **LoomFormer-Medium**                            | 432.11M | `96 → 96`                   | **91.1%**                | 114.8%                 |
+| **LoomFormer-Large**                             | 777.85M | `96 → 128`                  | **84.5%**                | 119.3%                 |
+| **LoomFormer-Large*** (`D=1280, n=16, d=80, r=16`) | 777.89M | `96 → 96`                 | **86.7%**                | 114.5%                 |
+| **LoomFormer-XL**                                | 1.432B  | `96 → 128`                  | **83.3%**                | 114.1%                 |
+| **LoomFormer-XL*** (`D=1600, n=20, d=80, r=16`)  | 1.432B  | `96 → 96`                   | **85.2%**                | 110.1%                 |
+| **LoomFormer-2.8B** (`r=20`)                     | 2.774B  | `96 → 128`                  | **84.8%**                | 108.7%                 |
+| **LoomFormer-2.8B*** (`r=16`)                    | 2.757B  | `96 → 96`                   | **88.8%**                | 108.2%                 |
 
 
-At 162M scale, **LoomLlama-162M** reaches `Llama-162M`'s final 2B-token validation loss (`3.4243`) in **~1.14B tokens** (**1.75× token efficiency**) and **77.3% of Llama's wall-clock time**, while matching `fast_inference` prefill + decode to `KL = 1.70e-4` after training.
+*Tip — FlashAttention-2 `HEADDIM` bucket alignment:* The default YAMLs in `configs/` preserve the exact paper architectures, and every row above is measured against the **unchanged** paper Llama baseline at that scale. When training LoomFormer on GPUs, you can adjust only LoomFormer's `(n, d, r)` (keeping `n` and `L` unchanged and re-matching total parameters via FFN width when `d` changes) so that `d + r` stays within the same native FlashAttention-2 `HEADDIM` bucket (`64 / 96 / 128`) as Llama—reducing attention-kernel overhead and peak memory with minimal expected impact on final loss (e.g., `162M` `76.0% → 77.8%`, `Large` `84.5% → 86.7%` and `-4.8 pp` peak mem, `XL` `83.3% → 85.2%` and `-4.0 pp` peak mem, `2.8B` `84.8% → 88.8%`).
 
-![162M Llama vs LoomLlama Training & Validation Loss on 2B FineWeb Tokens](../assets/pytorch_train_162m_2b.png)
+**FineWeb 2B-token validation (**`160m`**,** `T=4096, B=128`**):** **LoomLlama-162M** achieves **3.2696** val loss / **26.30** PPL (−0.202 loss vs. Llama-162M **3.4711** / **32.17**; `KL = 1.34e-4` against `fast_inference` prefill + decode):
+
+![162M Llama vs LoomLlama Training & Validation Loss on 2B FineWeb Tokens (T=4096, B=128)](../assets/pytorch_train_162m_2b.png)
 
 ---
 

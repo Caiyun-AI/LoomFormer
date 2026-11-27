@@ -1,0 +1,60 @@
+# LoomFormer-2.8B (2,773,824,032 params; matched Llama-2.8B: 2,773,649,920 params)
+# Uses the paper's 2.8B head/slot geometry (D = 32 * 80 = 2560, L = 32, d_k = 64, d_r = 640, r = 20) on Llama SwiGLU backbone.
+#
+# Tip: pass `--rope-dim 16` to align `d + r = 96` to FlashAttention-2's native `HEADDIM=96` bucket
+# (cuts training overhead on 8xA800 from +17.9% down to ~+12.5%, reaching ~89% of Llama-2.8B speed).
+#
+# Reproduce LoomFormer-2.8B on 8xA800-80GB:
+#   torchrun --standalone --nproc_per_node=8 pytorch/train_loom.py --config pytorch/configs/loomformer_2p8b.yml
+# Reproduce parameter-matched Llama-2.8B baseline:
+#   torchrun --standalone --nproc_per_node=8 pytorch/train_loom.py --config pytorch/configs/loomformer_2p8b.yml --no-loom \
+#     --out-dir pytorch/runs/llama_2p8b_seq4096_b128
+
+# Model architecture (D = 32 * 80 = 2560, L = 32; d + r = 100 -> FA2 HEADDIM=128; r = 16 -> FA2 HEADDIM=96)
+preset: "2.8b"
+loom_enabled: true
+vocab_size: 50304
+hidden_size: 2560
+num_layers: 32
+num_heads: 32
+head_dim: 80
+intermediate_size: 5203
+ffn_m_dim: 1962
+last_ffn_x_dim: 6653
+d_k: 64
+d_r: 640
+rope_dim: 20
+situ_beta1: 0.0
+situ_beta2: 0.0
+init_std: 0.006
+
+# Runtime & memory optimization
+compile: true
+compile_mode: "default"
+grad_checkpoint: true
+dtype: "bfloat16"
+
+# Schedule & optimizer (~52.4B tokens = 100000 steps * 524,288 tok/step; 8 GPUs: 4 * 8 * 4 = 128)
+seq_len: 4096
+batch_size: 128
+micro_batch_size: 4
+grad_accum: 4
+steps: 100000
+lr: 1.6e-4
+min_lr_ratio: 0.1
+warmup_steps: 1000
+weight_decay: 0.1
+beta1: 0.9
+beta2: 0.95
+grad_clip: 1.0
+seed: 42
+
+# Data, evaluation & checkpointing
+num_train_shards: 103
+log_every: 25
+eval_every: 2000
+val_tokens: 2097152
+final_val_tokens: 10485760
+out_dir: "pytorch/runs/loomformer_2p8b_seq4096_b128"
+save_ckpt: true
+verify_inference: true

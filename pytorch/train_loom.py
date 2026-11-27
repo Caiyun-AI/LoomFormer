@@ -5,25 +5,23 @@ the fused Triton training engine (`pytorch/training/engine.py` + `pytorch/traini
 `fast_inference.kernels_llama`), `torch.compile`, JAX-aligned AdamW weight-decay masking & initialization,
 FineWeb10B (`modded-nanogpt`) data, HuggingFace checkpoint saving, and post-training `fast_inference` alignment.
 
-Built-in parameter-matched presets (`--preset`):
-  - `160m`   (~162.2M, D=768,  L=12, n=12, d=64) — 2B-token FineWeb benchmark
-  - `medium` (~432.1M, D=1200, L=18, n=16, d=75) — paper Medium architecture
+Built-in YAML configs (`pytorch/configs/`, passed via `--config`):
+  - `loomformer_160m.yml`   (~162.2M, D=768,  L=12, n=12, d=64, d_k=24, d_r=128, r=16)
+  - `loomformer_medium.yml` (~432.1M, D=1200, L=18, n=16, d=75, d_k=32, d_r=256, r=18)
+  - `loomformer_large.yml`  (~777.8M, D=1536, L=22, n=16, d=96, d_k=32, d_r=256, r=24)
+  - `loomformer_xl.yml`     (~1.432B, D=1920, L=28, n=20, d=96, d_k=40, d_r=400, r=24)
+  - `loomformer_2p8b.yml`   (~2.774B, D=2560, L=32, n=32, d=80, d_k=64, d_r=640, r=20)
 
 Examples:
-  # 1. 162M 2B-token FineWeb comparison (8 GPUs, LoomLlama vs matched Llama):
-  torchrun --standalone --nproc_per_node=8 pytorch/train_loom.py \
-      --preset 160m --loom --compile --steps 7630 --batch-size 256 --micro-batch-size 32 --seq-len 1024 \
-      --lr 1e-3 --warmup-steps 150 --num-train-shards 20 --out-dir pytorch/runs/loomllama_162m_2b --save-ckpt
+  # 1. Train any scale directly from its YAML config (8 GPUs):
+  torchrun --standalone --nproc_per_node=8 pytorch/train_loom.py --config pytorch/configs/loomformer_160m.yml
 
-  # 2. Matched Llama baseline (same command with `--no-loom`):
-  torchrun --standalone --nproc_per_node=8 pytorch/train_loom.py \
-      --preset 160m --no-loom --compile --steps 7630 --batch-size 256 --micro-batch-size 32 --seq-len 1024 \
-      --lr 1e-3 --warmup-steps 150 --num-train-shards 20 --out-dir pytorch/runs/llama_162m_2b --save-ckpt
+  # 2. Parameter-matched Llama baseline (any CLI flag overrides the YAML):
+  torchrun --standalone --nproc_per_node=8 pytorch/train_loom.py --config pytorch/configs/loomformer_160m.yml --no-loom \
+      --out-dir pytorch/runs/llama_162m_2b_seq4096_b128
 
-  # 3. Paper Medium 432M (`T=4096, B=128, micro_bs=16`, with `--grad-checkpoint`):
-  torchrun --standalone --nproc_per_node=8 pytorch/train_loom.py \
-      --preset medium --loom --compile --grad-checkpoint --steps 13500 --batch-size 128 --micro-batch-size 16 \
-      --seq-len 4096 --lr 3e-4 --warmup-steps 135 --num-train-shards 70 --out-dir pytorch/runs/loomformer_medium --save-ckpt
+  # 3. Override any hyperparameter on the fly (e.g. FA2 HEADDIM=96 alignment on 2.8B):
+  torchrun --standalone --nproc_per_node=8 pytorch/train_loom.py --config pytorch/configs/loomformer_2p8b.yml --rope-dim 16
 """
 import argparse
 from contextlib import nullcontext
@@ -38,6 +36,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
+import yaml
 
 PYTORCH_ROOT = os.path.dirname(os.path.abspath(__file__))
 if PYTORCH_ROOT not in sys.path:
@@ -184,14 +183,40 @@ def verify_inference_alignment(
 # Main Training Loop
 # ==============================================================================
 
+def _load_yaml_config(path: str) -> Dict:
+  """Load a flat YAML training config into an argparse-compatible dict."""
+  with open(path, "r", encoding="utf-8") as f:
+    raw = yaml.safe_load(f)
+  if raw is None:
+    return {}
+  if not isinstance(raw, dict):
+    raise ValueError(f"Expected a YAML mapping in {path!r}, got {type(raw).__name__}")
+  return {str(k).replace("-", "_"): v for k, v in raw.items()}
+
+
+def _cli_has_flag(argv: List[str], *flags: str) -> bool:
+  return any(tok in flags or any(tok.startswith(f + "=") for f in flags) for tok in argv)
+
+
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-  p = argparse.ArgumentParser(description="Train ~162M/432M LoomLlama or matched Llama on FineWeb10B.")
+  raw_argv = list(sys.argv[1:] if argv is None else argv)
+
+  # Stage 1: parse optional `--config` / `-c` first so YAML sets defaults and CLI flags always override YAML.
+  cfg_pre = argparse.ArgumentParser(add_help=False)
+  cfg_pre.add_argument("-c", "--config", type=str, default="", help="Path to YAML training config (e.g. pytorch/configs/loomformer_160m.yml)")
+  pre_args, _ = cfg_pre.parse_known_args(raw_argv)
+
+  p = argparse.ArgumentParser(
+      description="Train LoomFormer or parameter-matched Llama on FineWeb10B (via `--config` YAML or CLI flags).",
+      parents=[cfg_pre],
+  )
   # Architecture switches
   loom_grp = p.add_mutually_exclusive_group()
-  loom_grp.add_argument("--loom", dest="loom_enabled", action="store_true", default=True, help="Enable Loom Attention (LoomLlama)")
-  loom_grp.add_argument("--no-loom", dest="loom_enabled", action="store_false", help="Disable Loom Attention (standard Llama baseline)")
-  p.add_argument("--compile", action="store_true", help="Enable torch.compile on model and fused cross-entropy loss")
-  p.add_argument("--grad-checkpoint", action="store_true", help="Enable full per-layer activation checkpointing (matches JAX remat_policy=full)")
+  loom_grp.add_argument("--loom", dest="loom_enabled", action="store_true", help="Enable Loom Attention (LoomFormer)")
+  loom_grp.add_argument("--no-loom", dest="loom_enabled", action="store_false", help="Disable Loom Attention (parameter-matched Llama baseline)")
+  p.set_defaults(loom_enabled=True)
+  p.add_argument("--compile", action=argparse.BooleanOptionalAction, default=False, help="Enable torch.compile on model and fused cross-entropy loss")
+  p.add_argument("--grad-checkpoint", action=argparse.BooleanOptionalAction, default=False, help="Enable full per-layer activation checkpointing (matches JAX remat_policy=full)")
   p.add_argument(
       "--compile-mode",
       type=str,
@@ -202,11 +227,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
   # Model preset & optional overrides (0 = inherit from --preset)
   p.add_argument("--preset", type=str, default="160m", choices=sorted(MODEL_PRESETS),
-                 help="Parameter-matched model preset: 160m (~162.2M), medium (~432.1M)")
+                 help="Parameter-matched model preset: 160m (~162.2M), medium (~432.1M), large (~777.8M), xl (~1.43B), 2.8b (~2.77B)")
   p.add_argument("--vocab-size", type=int, default=0, help="Override vocab_size (0 = use preset)")
   p.add_argument("--hidden-size", type=int, default=0, help="Override hidden_size (0 = use preset)")
   p.add_argument("--num-layers", type=int, default=0, help="Override num_hidden_layers (0 = use preset)")
   p.add_argument("--num-heads", type=int, default=0, help="Override num_attention_heads (0 = use preset)")
+  p.add_argument("--head-dim", type=int, default=0, help="Per-head dim (0 = infer hidden_size // num_heads; >0 asserts hidden_size == num_heads * head_dim)")
   p.add_argument("--intermediate-size", type=int, default=0, help="Override FFN intermediate_size (0 = use preset)")
   p.add_argument("--ffn-m-dim", type=int, default=0, help="Override Loom FFN_M width (0 = use preset)")
   p.add_argument("--last-ffn-x-dim", type=int, default=0, help="Override last-layer FFN_X width (0 = use preset)")
@@ -220,12 +246,15 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
   # Data (FineWeb10B from modded-nanogpt)
   p.add_argument("--data-dir", type=str, default=os.path.join(PYTORCH_ROOT, "data", "fineweb10B"))
   p.add_argument("--num-train-shards", type=int, default=2, help="Number of 100M-token training shards to download/use")
-  p.add_argument("--skip-download", action="store_true", help="Assume FineWeb shards already exist in --data-dir")
+  p.add_argument("--skip-download", action=argparse.BooleanOptionalAction, default=False, help="Assume FineWeb shards already exist in --data-dir")
 
   # Training hyperparameters
   p.add_argument("--steps", type=int, default=1500, help="Total optimizer steps")
   p.add_argument("--batch-size", type=int, default=64, help="Global batch size in sequences")
   p.add_argument("--micro-batch-size", type=int, default=8, help="Per-GPU micro-batch size in sequences")
+  p.add_argument("--grad-accum", type=int, default=0,
+                 help="Gradient accumulation steps (0 = auto-compute batch_size // (micro_batch_size * world_size); "
+                      ">0 asserts batch_size == micro_batch_size * world_size * grad_accum)")
   p.add_argument("--seq-len", type=int, default=1024, help="Sequence length in tokens")
   p.add_argument("--lr", type=float, default=6e-4, help="Peak AdamW learning rate")
   p.add_argument("--min-lr-ratio", type=float, default=0.1, help="Final cosine LR fraction of peak LR")
@@ -243,10 +272,113 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
   p.add_argument("--val-tokens", type=int, default=2_097_152, help="Tokens per intermediate val eval (default 2M; modded-nanogpt full val is 10,485,760)")
   p.add_argument("--final-val-tokens", type=int, default=10_485_760, help="Tokens for final val eval (10,485,760 matches modded-nanogpt)")
   p.add_argument("--out-dir", type=str, default="", help="Optional output directory to save metrics and final HF checkpoint")
-  p.add_argument("--save-ckpt", action="store_true", help="Save final HuggingFace checkpoint into --out-dir")
-  p.add_argument("--verify-inference", action="store_true", default=True, help="Verify fast_inference alignment after training")
-  p.add_argument("--no-verify-inference", dest="verify_inference", action="store_false")
-  return p.parse_args(argv)
+  p.add_argument("--save-ckpt", action=argparse.BooleanOptionalAction, default=False, help="Save final HuggingFace checkpoint into --out-dir")
+  p.add_argument("--verify-inference", action=argparse.BooleanOptionalAction, default=True, help="Verify fast_inference alignment after training")
+
+  yaml_loom_enabled = None
+  if pre_args.config:
+    yaml_cfg = _load_yaml_config(pre_args.config)
+    valid_dests = {a.dest for a in p._actions} - {"help", "config"}
+    unknown = sorted(set(yaml_cfg.keys()) - valid_dests)
+    if unknown:
+      raise ValueError(f"Unknown key(s) in config {pre_args.config!r}: {unknown}")
+    yaml_loom_enabled = yaml_cfg.get("loom_enabled", None)
+    p.set_defaults(**yaml_cfg)
+
+  args = p.parse_args(raw_argv)
+
+  # If a Loom YAML (`loom_enabled: true`) is switched to `--no-loom` on CLI without an explicit
+  # `--intermediate-size`, fall back to the preset's parameter-matched Llama FFN width.
+  if yaml_loom_enabled is True and not args.loom_enabled:
+    if not _cli_has_flag(raw_argv, "--intermediate-size"):
+      args.intermediate_size = 0
+    if not _cli_has_flag(raw_argv, "--last-ffn-x-dim"):
+      args.last_ffn_x_dim = 0
+  return args
+
+
+def build_model_config_from_args(args: argparse.Namespace):
+  """Construct and validate a `LoomFormerConfig` from parsed YAML/CLI arguments."""
+  for field in ("vocab_size", "hidden_size", "num_layers", "num_heads", "head_dim",
+                "intermediate_size", "ffn_m_dim", "last_ffn_x_dim", "d_k", "d_r", "rope_dim"):
+    val = getattr(args, field)
+    if val < 0:
+      raise ValueError(f"{field} ({val}) must be >= 0")
+
+  base_tmp = build_preset_config(args.preset, loom_enabled=args.loom_enabled)
+  h_eff = args.hidden_size if args.hidden_size > 0 else base_tmp.hidden_size
+  n_eff = args.num_heads if args.num_heads > 0 else base_tmp.num_attention_heads
+  if args.head_dim > 0:
+    d_eff = args.head_dim
+    if h_eff != n_eff * d_eff:
+      raise ValueError(
+          f"hidden_size ({h_eff}) != num_heads ({n_eff}) * head_dim ({d_eff}) = {n_eff * d_eff}. "
+          f"Ensure hidden_size, num_heads, and head_dim are consistent."
+      )
+  else:
+    if h_eff % n_eff != 0:
+      raise ValueError(f"hidden_size ({h_eff}) must be divisible by num_heads ({n_eff}).")
+    d_eff = h_eff // n_eff
+
+  extra_cfg = dict(
+      hidden_size=h_eff,
+      num_attention_heads=n_eff,
+      head_dim=d_eff,
+      max_position_embeddings=max(2048, args.seq_len),
+      situ_beta1=args.situ_beta1,
+      situ_beta2=args.situ_beta2,
+  )
+  if args.vocab_size > 0:
+    extra_cfg["vocab_size"] = args.vocab_size
+  if args.num_layers > 0:
+    extra_cfg["num_hidden_layers"] = args.num_layers
+  if args.init_std > 0:
+    extra_cfg["initializer_range"] = args.init_std
+  if args.intermediate_size > 0:
+    extra_cfg["intermediate_size"] = args.intermediate_size
+    if not args.loom_enabled:
+      extra_cfg["last_ffn_x_dim"] = args.intermediate_size
+  if args.loom_enabled:
+    if args.d_k > 0:
+      extra_cfg["d_k"] = args.d_k
+    if args.d_r > 0:
+      extra_cfg["d_r"] = args.d_r
+    if args.rope_dim > 0:
+      if args.rope_dim % 2 != 0:
+        raise ValueError(f"rope_dim ({args.rope_dim}) must be even.")
+      extra_cfg["rope_dim"] = args.rope_dim
+    if args.ffn_m_dim > 0:
+      extra_cfg["ffn_m_dim"] = args.ffn_m_dim
+    if args.last_ffn_x_dim > 0:
+      extra_cfg["last_ffn_x_dim"] = args.last_ffn_x_dim
+  elif d_eff != base_tmp.head_dim:
+    extra_cfg["mha_nope_dim"] = d_eff % 2
+  return build_preset_config(args.preset, loom_enabled=args.loom_enabled, **extra_cfg)
+
+
+def resolve_grad_accum(batch_size: int, micro_batch_size: int, world_size: int, grad_accum: int) -> int:
+  """Validate `batch_size == micro_batch_size * world_size * grad_accum` (or infer `grad_accum` when `grad_accum == 0`)."""
+  if batch_size <= 0 or micro_batch_size <= 0 or world_size <= 0:
+    raise ValueError(
+        f"batch_size ({batch_size}), micro_batch_size ({micro_batch_size}), and world_size ({world_size}) must be positive"
+    )
+  if grad_accum < 0:
+    raise ValueError(f"grad_accum ({grad_accum}) must be >= 0")
+  if grad_accum > 0:
+    expected = micro_batch_size * world_size * grad_accum
+    if batch_size != expected:
+      raise ValueError(
+          f"batch_size ({batch_size}) != micro_batch_size ({micro_batch_size}) * world_size ({world_size}) * "
+          f"grad_accum ({grad_accum}) = {expected}. Adjust --grad-accum / --micro-batch-size for {world_size} GPU(s) "
+          f"(or pass --grad-accum 0 to auto-compute)."
+      )
+    return grad_accum
+  denom = micro_batch_size * world_size
+  if batch_size % denom != 0:
+    raise ValueError(
+        f"batch_size ({batch_size}) must be divisible by micro_batch_size ({micro_batch_size}) * world_size ({world_size}) = {denom}"
+    )
+  return batch_size // denom
 
 
 def main(argv: Optional[List[str]] = None) -> Dict:
@@ -266,10 +398,7 @@ def main(argv: Optional[List[str]] = None) -> Dict:
     device = "cuda" if torch.cuda.is_available() else "cpu"
   is_master = rank == 0
 
-  assert args.batch_size % (args.micro_batch_size * world_size) == 0, (
-      f"batch_size ({args.batch_size}) must be divisible by micro_batch_size ({args.micro_batch_size}) * world_size ({world_size})"
-  )
-  grad_accum = args.batch_size // (args.micro_batch_size * world_size)
+  grad_accum = resolve_grad_accum(args.batch_size, args.micro_batch_size, world_size, args.grad_accum)
   tokens_per_step = args.batch_size * args.seq_len
 
   torch.manual_seed(args.seed)
@@ -289,43 +418,8 @@ def main(argv: Optional[List[str]] = None) -> Dict:
   train_loader = FineWebShardLoader(train_files, args.micro_batch_size, args.seq_len, rank, world_size, device)
   val_loader = FineWebShardLoader(val_files, args.micro_batch_size, args.seq_len, rank, world_size, device)
 
-  # Build model config from --preset plus any explicit CLI overrides
-  extra_cfg = dict(
-      max_position_embeddings=max(2048, args.seq_len),
-      situ_beta1=args.situ_beta1,
-      situ_beta2=args.situ_beta2,
-  )
-  if args.vocab_size > 0:
-    extra_cfg["vocab_size"] = args.vocab_size
-  if args.hidden_size > 0:
-    extra_cfg["hidden_size"] = args.hidden_size
-  if args.num_layers > 0:
-    extra_cfg["num_hidden_layers"] = args.num_layers
-  if args.num_heads > 0:
-    extra_cfg["num_attention_heads"] = args.num_heads
-  if args.hidden_size > 0 or args.num_heads > 0:
-    base_tmp = build_preset_config(args.preset, loom_enabled=args.loom_enabled)
-    h_eff = args.hidden_size if args.hidden_size > 0 else base_tmp.hidden_size
-    n_eff = args.num_heads if args.num_heads > 0 else base_tmp.num_attention_heads
-    extra_cfg["head_dim"] = h_eff // n_eff
-  if args.init_std > 0:
-    extra_cfg["initializer_range"] = args.init_std
-  if args.intermediate_size > 0:
-    extra_cfg["intermediate_size"] = args.intermediate_size
-    if not args.loom_enabled:
-      extra_cfg["last_ffn_x_dim"] = args.intermediate_size
-  if args.loom_enabled:
-    if args.d_k > 0:
-      extra_cfg["d_k"] = args.d_k
-    if args.d_r > 0:
-      extra_cfg["d_r"] = args.d_r
-    if args.rope_dim > 0:
-      extra_cfg["rope_dim"] = args.rope_dim
-    if args.ffn_m_dim > 0:
-      extra_cfg["ffn_m_dim"] = args.ffn_m_dim
-    if args.last_ffn_x_dim > 0:
-      extra_cfg["last_ffn_x_dim"] = args.last_ffn_x_dim
-  config = build_preset_config(args.preset, loom_enabled=args.loom_enabled, **extra_cfg)
+  # Build model config from `--config` / `--preset` plus any explicit CLI overrides
+  config = build_model_config_from_args(args)
   raw_model = LoomFormerForCausalLM(config).to(device=device, dtype=torch.float32)
   train_model = build_train_model(raw_model, grad_checkpoint=args.grad_checkpoint)
   param_stats = count_parameters(raw_model)
@@ -378,6 +472,8 @@ def main(argv: Optional[List[str]] = None) -> Dict:
 
   if is_master:
     log_print("=" * 84)
+    if args.config:
+      log_print(f"YAML Config: {args.config}")
     log_print(
         f"Training {arch_name} | params={param_stats['total']:,} (non-emb={param_stats['non_embedding']:,}) "
         f"| AdamW lr={args.lr:.2e} | compile={args.compile_mode if args.compile else False} "

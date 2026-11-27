@@ -15,14 +15,22 @@ if PYTORCH_ROOT not in sys.path:
 
 import fast_inference  # noqa: E402
 from loomformer import LoomFormerConfig, LoomFormerForCausalLM  # noqa: E402
-from train_loom import build_optimizer, verify_inference_alignment  # noqa: E402
+from train_loom import (  # noqa: E402
+    build_model_config_from_args,
+    build_optimizer,
+    parse_args,
+    resolve_grad_accum,
+    verify_inference_alignment,
+)
 from training.configs import (  # noqa: E402
     build_loomllama_160m_config,
     build_loomllama_medium_config,
+    build_loomllama_xl_config,
     count_parameters,
 )
 from training.data import FINEWEB_MAGIC, FINEWEB_VERSION, FineWebShardLoader, HEADER_INT32  # noqa: E402
 from training.engine import build_train_model  # noqa: E402
+from training.triton_ops import _select_kernel_config  # noqa: E402
 
 
 def _mean_kl(p: torch.Tensor, q: torch.Tensor) -> float:
@@ -379,6 +387,183 @@ class LoomTrainingTest(unittest.TestCase):
         if b.norm().item() > 1e-5 and b.numel() > 1:
           cos = F.cosine_similarity(a[None], b[None]).item()
           self.assertGreater(cos, 0.995, f"Low grad_ckpt cosine {cos:.5f} in {k} (loom={loom_on})")
+
+  def test_adaptive_kernel_config_selection(self):
+    """Verify shape-adaptive Triton dispatch covers 160M through paper 2.8B geometries."""
+    c_160m = _select_kernel_config(12, 64, 24)
+    self.assertFalse(c_160m.use_fb_read)
+    self.assertEqual((c_160m.read_fwd_warps, c_160m.write_fwd_warps, c_160m.write_bwd_warps), (2, 1, 1))
+
+    c_large = _select_kernel_config(16, 96, 32)
+    self.assertFalse(c_large.use_fb_read)
+    self.assertEqual((c_large.read_fwd_warps, c_large.write_fwd_warps, c_large.write_bwd_warps), (2, 1, 1))
+
+    c_xl = _select_kernel_config(20, 96, 40)
+    self.assertTrue(c_xl.use_fb_read)
+    self.assertEqual((c_xl.v0, c_xl.v1, c_xl.m_elems), (32, 16, 4608))
+    self.assertEqual(
+        (c_xl.read_fwd_warps, c_xl.read_fwd_fb_warps, c_xl.m_prep_warps,
+         c_xl.read_bwd_fb_warps, c_xl.mshift_bwd_warps, c_xl.write_fwd_warps, c_xl.write_bwd_warps),
+        (1, 1, 1, 4, 2, 2, 2),
+    )
+
+    # Paper LoomPythia-2.8B geometry: N=32, K=80, V=64 (V0=64, V1=0, m_elems=5120)
+    c_2p8b = _select_kernel_config(32, 80, 64)
+    self.assertTrue(c_2p8b.use_fb_read)
+    self.assertEqual((c_2p8b.v0, c_2p8b.v1, c_2p8b.m_elems), (64, 0, 5120))
+    self.assertEqual(
+        (c_2p8b.read_fwd_warps, c_2p8b.read_fwd_fb_warps, c_2p8b.m_prep_warps,
+         c_2p8b.read_bwd_fb_warps, c_2p8b.mshift_bwd_warps, c_2p8b.write_fwd_warps, c_2p8b.write_bwd_warps),
+        (2, 1, 2, 2, 4, 2, 2),
+    )
+
+  def test_2p8b_geometry_triton_compile_ckpt_and_inference(self):
+    """Verify paper 2.8B head/slot geometry (D=2560, N=32, K=80, V=64, D_r=640, r=20) fwd/bwd, ckpt+compile & fast_inference."""
+    if not torch.cuda.is_available():
+      self.skipTest("CUDA required for 2.8B geometry Triton test.")
+
+    torch._dynamo.reset()
+    cfg = build_loomllama_xl_config(
+        loom_enabled=True,
+        vocab_size=512,
+        num_hidden_layers=2,
+        hidden_size=2560,
+        num_attention_heads=32,
+        head_dim=80,
+        d_k=64,
+        d_r=640,
+        rope_dim=20,
+        intermediate_size=2048,
+        ffn_m_dim=1024,
+        last_ffn_x_dim=2560,
+        embed_write_divisor=0.0020825863,
+    )
+    torch.manual_seed(2800)
+    model = LoomFormerForCausalLM(cfg).cuda().train()
+    with torch.no_grad():
+      for name, p in model.named_parameters():
+        if any(tag in name for tag in ("W_rg", "W_sg", "q_bar")):
+          p.add_(0.05 * torch.randn_like(p))
+
+    ids = torch.randint(1, cfg.vocab_size, (2, 128), device="cuda")
+    targets = torch.randint(1, cfg.vocab_size, (2, 128), device="cuda")
+
+    # 1. Pure PyTorch BF16 reference fwd + bwd
+    model.zero_grad(set_to_none=True)
+    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+      logits_ref = model(ids, use_cache=False).logits
+      loss_ref = F.cross_entropy(logits_ref.flatten(0, 1), targets.flatten())
+    loss_ref.backward()
+    grads_ref = {k: p.grad.detach().clone().float() for k, p in model.named_parameters() if p.grad is not None}
+
+    # 2. Triton precomputed-FB cached path (`grad_checkpoint=False`)
+    tm_cached = build_train_model(model, grad_checkpoint=False).train()
+    model.zero_grad(set_to_none=True)
+    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+      logits_tri = tm_cached(ids)
+      loss_tri = F.cross_entropy(logits_tri.flatten(0, 1), targets.flatten())
+    loss_tri.backward()
+    grads_tri = {k: p.grad.detach().clone().float() for k, p in model.named_parameters() if p.grad is not None}
+
+    self.assertLess(abs(loss_ref.item() - loss_tri.item()), 2.5e-3)
+    self.assertLess(_mean_kl(logits_ref, logits_tri), 1e-4)
+    self.assertEqual(set(grads_ref.keys()), set(grads_tri.keys()))
+    for k in grads_ref:
+      a, b = grads_tri[k].flatten(), grads_ref[k].flatten()
+      self.assertTrue(torch.isfinite(a).all(), f"Non-finite 2.8B grad in {k}")
+      if b.norm().item() > 1e-5 and b.numel() > 1:
+        cos = F.cosine_similarity(a[None], b[None]).item()
+        self.assertGreater(cos, 0.99, f"Low 2.8B grad cosine {cos:.5f} in {k}")
+
+    # 3. `grad_checkpoint=True` (FB recompute path) + `torch.compile` 0 graph breaks + grad parity
+    tm_ckpt = build_train_model(model, grad_checkpoint=True).train()
+    def _step(x, y):
+      with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+        return F.cross_entropy(tm_ckpt(x).flatten(0, 1), y.flatten())
+
+    exp = torch._dynamo.explain(_step)(ids, targets)
+    self.assertEqual(exp.graph_break_count, 0, f"Unexpected 2.8B Dynamo breaks: {exp.break_reasons}")
+
+    compiled = torch.compile(tm_ckpt)
+    model.zero_grad(set_to_none=True)
+    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+      loss_comp = F.cross_entropy(compiled(ids).flatten(0, 1), targets.flatten())
+    loss_comp.backward()
+    self.assertLess(abs(loss_ref.item() - loss_comp.item()), 2.5e-3)
+    for k in grads_ref:
+      a, b = dict(model.named_parameters())[k].grad.detach().float().flatten(), grads_ref[k].flatten()
+      self.assertTrue(torch.isfinite(a).all(), f"Non-finite 2.8B compiled grad in {k}")
+      if b.norm().item() > 1e-5 and b.numel() > 1:
+        cos = F.cosine_similarity(a[None], b[None]).item()
+        self.assertGreater(cos, 0.99, f"Low 2.8B compiled grad cosine {cos:.5f} in {k}")
+
+    # 4. fast_inference Triton prefill + decode alignment
+    align = verify_inference_alignment(model, seq_len=128, prefill_len=96, batch_size=2)
+    self.assertEqual(align["fast_kernels_active"], 1.0, "Expected fast_inference Triton kernels active for 2.8B geometry")
+    self.assertLess(align["kl_train_vs_fast_full"], 5e-4, f"2.8B alignment KL too high: {align}")
+    self.assertLess(align["kl_hf_ref_vs_fast_full"], 5e-4, f"2.8B HF ref vs fast KL too high: {align}")
+
+  def test_yaml_configs_and_cli_override_precedence(self):
+    """Verify all standalone `pytorch/configs/loomformer_*.yml` configs load, match params, and respect CLI overrides."""
+    expected = [
+        ("loomformer_160m.yml",   162_223_020,   162_220_800),
+        ("loomformer_medium.yml", 432_112_228,   432_121_200),
+        ("loomformer_large.yml",  777_849_500,   777_850_368),
+        ("loomformer_xl.yml",   1_432_396_996, 1_432_398_720),
+        ("loomformer_2p8b.yml", 2_773_824_032, 2_773_649_920),
+    ]
+    cfg_dir = os.path.join(PYTORCH_ROOT, "configs")
+    for fname, loom_params, llama_params in expected:
+      yml_path = os.path.join(cfg_dir, fname)
+      self.assertTrue(os.path.isfile(yml_path), f"Missing config YAML: {yml_path}")
+
+      args_loom = parse_args(["--config", yml_path])
+      self.assertTrue(args_loom.loom_enabled)
+      self.assertTrue(args_loom.compile)
+      self.assertTrue(args_loom.grad_checkpoint)
+      self.assertGreater(args_loom.head_dim, 0)
+      self.assertEqual(args_loom.hidden_size, args_loom.num_heads * args_loom.head_dim)
+      self.assertGreater(args_loom.grad_accum, 0)
+      self.assertEqual(resolve_grad_accum(args_loom.batch_size, args_loom.micro_batch_size, 8, args_loom.grad_accum), args_loom.grad_accum)
+      with self.assertRaises(ValueError):
+        resolve_grad_accum(args_loom.batch_size, args_loom.micro_batch_size, 4, args_loom.grad_accum)
+      self.assertEqual(resolve_grad_accum(args_loom.batch_size, args_loom.micro_batch_size, 4, 0), args_loom.grad_accum * 2)
+      cfg_loom = build_model_config_from_args(args_loom)
+      with torch.device("meta"):
+        c_loom = count_parameters(LoomFormerForCausalLM(cfg_loom))["total"]
+      self.assertEqual(c_loom, loom_params, f"Param mismatch in {fname} (Loom)")
+
+      # `--no-loom` must automatically switch to the parameter-matched Llama baseline FFN width
+      args_llama = parse_args(["--config", yml_path, "--no-loom"])
+      self.assertFalse(args_llama.loom_enabled)
+      cfg_llama = build_model_config_from_args(args_llama)
+      with torch.device("meta"):
+        c_llama = count_parameters(LoomFormerForCausalLM(cfg_llama))["total"]
+      self.assertEqual(c_llama, llama_params, f"Param mismatch in {fname} (--no-loom)")
+
+    # Verify explicit CLI flags override YAML defaults (including boolean toggles and model overrides)
+    yml_2p8b = os.path.join(cfg_dir, "loomformer_2p8b.yml")
+    args_ov = parse_args([
+        "--config", yml_2p8b, "--rope-dim", "16", "--steps", "10", "--no-compile", "--no-grad-checkpoint",
+    ])
+    self.assertEqual(args_ov.rope_dim, 16)
+    self.assertEqual(args_ov.steps, 10)
+    self.assertFalse(args_ov.compile)
+    self.assertFalse(args_ov.grad_checkpoint)
+    cfg_ov = build_model_config_from_args(args_ov)
+    self.assertEqual(cfg_ov.rope_dim, 16)
+    self.assertEqual(cfg_ov.head_dim + cfg_ov.rope_dim, 96)
+
+    # Verify inconsistent `hidden_size != num_heads * head_dim` raises ValueError
+    with self.assertRaises(ValueError):
+      build_model_config_from_args(parse_args(["--config", yml_2p8b, "--num-heads", "16"]))
+    with self.assertRaises(ValueError):
+      build_model_config_from_args(parse_args(["--config", yml_2p8b, "--head-dim", "64"]))
+    with self.assertRaises(ValueError):
+      build_model_config_from_args(parse_args(["--config", yml_2p8b, "--rope-dim", "17"]))
+    # Consistent simultaneous override succeeds
+    cfg_ok = build_model_config_from_args(parse_args(["--config", yml_2p8b, "--num-heads", "16", "--head-dim", "160"]))
+    self.assertEqual((cfg_ok.hidden_size, cfg_ok.num_attention_heads, cfg_ok.head_dim), (2560, 16, 160))
 
 
 if __name__ == "__main__":

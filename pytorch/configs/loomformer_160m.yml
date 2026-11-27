@@ -1,0 +1,56 @@
+# LoomLlama-162M (162,223,020 params; matched Llama-162M: 162,220,800 params; FineWeb 2B tokens)
+#
+# Reproduce LoomLlama-162M on 8xA800-80GB:
+#   torchrun --standalone --nproc_per_node=8 pytorch/train_loom.py --config pytorch/configs/loomformer_160m.yml
+# Reproduce parameter-matched Llama-162M baseline:
+#   torchrun --standalone --nproc_per_node=8 pytorch/train_loom.py --config pytorch/configs/loomformer_160m.yml --no-loom \
+#     --out-dir pytorch/runs/llama_162m_2b_seq4096_b128
+
+# Model architecture
+preset: "160m"
+loom_enabled: true
+vocab_size: 50304
+hidden_size: 768
+num_layers: 12
+num_heads: 12
+head_dim: 64
+intermediate_size: 1648
+ffn_m_dim: 736
+last_ffn_x_dim: 2560
+d_k: 24
+d_r: 128
+rope_dim: 16
+situ_beta1: 0.0
+situ_beta2: 0.0
+init_std: 0.02
+
+# Runtime & memory optimization
+compile: true
+compile_mode: "default"
+grad_checkpoint: true
+dtype: "bfloat16"
+
+# Schedule & optimizer (2.0B tokens = 3815 steps * 524,288 tok/step; 8 GPUs: 16 * 8 * 1 = 128)
+seq_len: 4096
+batch_size: 128
+micro_batch_size: 16
+grad_accum: 1
+steps: 3815
+lr: 1.0e-3
+min_lr_ratio: 0.1
+warmup_steps: 75
+weight_decay: 0.1
+beta1: 0.9
+beta2: 0.95
+grad_clip: 1.0
+seed: 42
+
+# Data, evaluation & checkpointing
+num_train_shards: 20
+log_every: 25
+eval_every: 250
+val_tokens: 2097152
+final_val_tokens: 10485760
+out_dir: "pytorch/runs/loomllama_162m_2b_seq4096_b128"
+save_ckpt: true
+verify_inference: true

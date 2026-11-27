@@ -7,6 +7,15 @@ Available presets (`vocab_size` untied embeddings, matching JAX LoomFormer confi
   - `medium` (vocab_size=50432, D=1200, L=18, n=16, d=75; Paper Section 5.1 & Appendix D):
       - Llama-Medium (`loom_enabled=False`):     432,121,200 params (311.08M non-embedding)
       - LoomFormer-Medium (`loom_enabled=True`): 432,112,228 params (311.07M non-embedding, -0.002% vs Llama)
+  - `large` (vocab_size=50432, D=1536, L=22, n=16, d=96; Paper Section 5.1 & Appendix D):
+      - Llama-Large (`loom_enabled=False`):      777,850,368 params (622.92M non-embedding)
+      - LoomFormer-Large (`loom_enabled=True`):  777,849,500 params (622.92M non-embedding, -0.0001% vs Llama)
+  - `xl` (vocab_size=50432, D=1920, L=28, n=20, d=96; Paper Section 5.1 & Appendix D):
+      - Llama-XL (`loom_enabled=False`):         1,432,398,720 params (1.239B non-embedding)
+      - LoomFormer-XL (`loom_enabled=True`):     1,432,396,996 params (1.239B non-embedding, -0.0001% vs Llama)
+  - `2.8b` (vocab_size=50304, D=2560, L=32, n=32, d=80; Paper 2.8B head/slot geometry on Llama SwiGLU backbone):
+      - Llama-2.8B (`loom_enabled=False`):       2,773,649,920 params (2.516B non-embedding)
+      - LoomFormer-2.8B (`loom_enabled=True`):   2,773,824,032 params (2.516B non-embedding, +0.0063% vs Llama)
 """
 import math
 from typing import Dict
@@ -143,14 +152,146 @@ def build_loomllama_medium_config(
   )
 
 
+def build_loomllama_large_config(
+    loom_enabled: bool = True,
+    vocab_size: int = 50432,
+    max_position_embeddings: int = 4096,
+    situ_beta1: float = 0.0,
+    situ_beta2: float = 0.0,
+    initializer_range: float = 0.006,
+    **overrides,
+) -> LoomFormerConfig:
+  """Return ~778M Paper-Large `LoomFormerConfig` (D=1536, L=22, n=16, d=96) or parameter-matched Llama baseline."""
+  hidden_size = overrides.pop("hidden_size", 1536)
+  num_hidden_layers = overrides.pop("num_hidden_layers", 22)
+  num_attention_heads = overrides.pop("num_attention_heads", 16)
+  head_dim = overrides.pop("head_dim", hidden_size // num_attention_heads)
+  preset = (
+      dict(
+          intermediate_size=3317,
+          ffn_m_dim=1539,
+          last_ffn_x_dim=5083,
+          d_k=32,
+          d_r=256,
+          rope_dim=24,
+          embed_write_divisor=0.0018161707314488303,
+      )
+      if loom_enabled
+      else dict(intermediate_size=4096, last_ffn_x_dim=4096, mha_nope_dim=0)
+  )
+  preset.update(overrides)
+  return _build_base_config(
+      loom_enabled=loom_enabled,
+      vocab_size=vocab_size,
+      hidden_size=hidden_size,
+      num_hidden_layers=num_hidden_layers,
+      num_attention_heads=num_attention_heads,
+      head_dim=head_dim,
+      max_position_embeddings=max_position_embeddings,
+      situ_beta1=situ_beta1,
+      situ_beta2=situ_beta2,
+      initializer_range=initializer_range,
+      **preset,
+  )
+
+
+def build_loomllama_xl_config(
+    loom_enabled: bool = True,
+    vocab_size: int = 50432,
+    max_position_embeddings: int = 4096,
+    situ_beta1: float = 0.0,
+    situ_beta2: float = 0.0,
+    initializer_range: float = 0.006,
+    **overrides,
+) -> LoomFormerConfig:
+  """Return ~1.43B Paper-XL `LoomFormerConfig` (D=1920, L=28, n=20, d=96) or parameter-matched Llama baseline."""
+  hidden_size = overrides.pop("hidden_size", 1920)
+  num_hidden_layers = overrides.pop("num_hidden_layers", 28)
+  num_attention_heads = overrides.pop("num_attention_heads", 20)
+  head_dim = overrides.pop("head_dim", hidden_size // num_attention_heads)
+  preset = (
+      dict(
+          intermediate_size=4048,
+          ffn_m_dim=1827,
+          last_ffn_x_dim=6277,
+          d_k=40,
+          d_r=400,
+          rope_dim=24,
+          embed_write_divisor=0.0020305404338184567,
+      )
+      if loom_enabled
+      else dict(intermediate_size=5120, last_ffn_x_dim=5120, mha_nope_dim=0)
+  )
+  preset.update(overrides)
+  return _build_base_config(
+      loom_enabled=loom_enabled,
+      vocab_size=vocab_size,
+      hidden_size=hidden_size,
+      num_hidden_layers=num_hidden_layers,
+      num_attention_heads=num_attention_heads,
+      head_dim=head_dim,
+      max_position_embeddings=max_position_embeddings,
+      situ_beta1=situ_beta1,
+      situ_beta2=situ_beta2,
+      initializer_range=initializer_range,
+      **preset,
+  )
+
+
+def build_loomllama_2p8b_config(
+    loom_enabled: bool = True,
+    vocab_size: int = 50304,
+    max_position_embeddings: int = 4096,
+    situ_beta1: float = 0.0,
+    situ_beta2: float = 0.0,
+    initializer_range: float = 0.006,
+    **overrides,
+) -> LoomFormerConfig:
+  """Return ~2.77B `LoomFormerConfig` matching the paper's 2.8B head/slot geometry (D=2560, L=32, n=32, d=80) or Llama baseline."""
+  hidden_size = overrides.pop("hidden_size", 2560)
+  num_hidden_layers = overrides.pop("num_hidden_layers", 32)
+  num_attention_heads = overrides.pop("num_attention_heads", 32)
+  head_dim = overrides.pop("head_dim", hidden_size // num_attention_heads)
+  preset = (
+      dict(
+          intermediate_size=5203,
+          ffn_m_dim=1962,
+          last_ffn_x_dim=6653,
+          d_k=64,
+          d_r=640,
+          rope_dim=20,
+          embed_write_divisor=0.0020825863,
+      )
+      if loom_enabled
+      else dict(intermediate_size=6824, last_ffn_x_dim=6824, mha_nope_dim=0)
+  )
+  preset.update(overrides)
+  return _build_base_config(
+      loom_enabled=loom_enabled,
+      vocab_size=vocab_size,
+      hidden_size=hidden_size,
+      num_hidden_layers=num_hidden_layers,
+      num_attention_heads=num_attention_heads,
+      head_dim=head_dim,
+      max_position_embeddings=max_position_embeddings,
+      situ_beta1=situ_beta1,
+      situ_beta2=situ_beta2,
+      initializer_range=initializer_range,
+      **preset,
+  )
+
+
 MODEL_PRESETS = {
     "160m": build_loomllama_160m_config,
     "medium": build_loomllama_medium_config,
+    "large": build_loomllama_large_config,
+    "xl": build_loomllama_xl_config,
+    "2.8b": build_loomllama_2p8b_config,
 }
 
 
 def build_preset_config(preset: str, loom_enabled: bool = True, **overrides) -> LoomFormerConfig:
-  """Build a named model preset (`'160m'` or `'medium'`) with optional field overrides."""
+  """Build a named model preset (`'160m'`, `'medium'`, `'large'`, `'xl'`, or `'2.8b'`) with optional field overrides."""
   if preset not in MODEL_PRESETS:
     raise ValueError(f"Unknown model preset {preset!r}; expected one of {sorted(MODEL_PRESETS)}")
   return MODEL_PRESETS[preset](loom_enabled=loom_enabled, **overrides)

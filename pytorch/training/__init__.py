@@ -2,7 +2,10 @@
 from .configs import (
     MODEL_PRESETS,
     build_loomllama_160m_config,
+    build_loomllama_2p8b_config,
+    build_loomllama_large_config,
     build_loomllama_medium_config,
+    build_loomllama_xl_config,
     build_preset_config,
     count_parameters,
 )
@@ -13,6 +16,9 @@ __all__ = [
     "MODEL_PRESETS",
     "build_loomllama_160m_config",
     "build_loomllama_medium_config",
+    "build_loomllama_large_config",
+    "build_loomllama_xl_config",
+    "build_loomllama_2p8b_config",
     "build_preset_config",
     "count_parameters",
     "FineWebShardLoader",

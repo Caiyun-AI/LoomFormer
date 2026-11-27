@@ -44,11 +44,12 @@ def _ksplit(k):
 
 @triton.jit
 def _load_m(P, K: tl.constexpr, K1P: tl.constexpr, V: tl.constexpr, V0: tl.constexpr, V1: tl.constexpr):
-  """M tiles (k 64 + K1P) x (v V0 + V1) of one token; K == 64 / V1 == 0 use zero placeholders."""
+  """M tiles (k 64 + K1P) x (v V0 + V1) of one token; supports K >= 16 (K < 64 masked, K <= 64 skips tail)."""
   k0 = tl.arange(0, 64)
+  km0 = (k0 < K)[:, None]
   a = tl.arange(0, V0)
   am = (a < V)[None, :]
-  m00 = tl.load(P + k0[:, None] * V + a[None, :], mask=am, other=0.)
+  m00 = tl.load(P + k0[:, None] * V + a[None, :], mask=km0 & am, other=0.)
   if K > 64:
     k1 = 64 + tl.arange(0, K1P)
     km = (k1 < K)[:, None]
@@ -58,7 +59,7 @@ def _load_m(P, K: tl.constexpr, K1P: tl.constexpr, V: tl.constexpr, V0: tl.const
   if V1 > 0:
     b = V0 + tl.arange(0, V1)
     bm = (b < V)[None, :]
-    m01 = tl.load(P + k0[:, None] * V + b[None, :], mask=bm, other=0.)
+    m01 = tl.load(P + k0[:, None] * V + b[None, :], mask=km0 & bm, other=0.)
     if K > 64:
       m11 = tl.load(P + k1[:, None] * V + b[None, :], mask=km & bm, other=0.)
     else:
@@ -73,9 +74,10 @@ def _load_m(P, K: tl.constexpr, K1P: tl.constexpr, V: tl.constexpr, V0: tl.const
 def _store_m(P, m00, m01, m10, m11, K: tl.constexpr, K1P: tl.constexpr, V: tl.constexpr, V0: tl.constexpr,
              V1: tl.constexpr):
   k0 = tl.arange(0, 64)
+  km0 = (k0 < K)[:, None]
   a = tl.arange(0, V0)
   am = (a < V)[None, :]
-  tl.store(P + k0[:, None] * V + a[None, :], m00, mask=am)
+  tl.store(P + k0[:, None] * V + a[None, :], m00, mask=km0 & am)
   if K > 64:
     k1 = 64 + tl.arange(0, K1P)
     km = (k1 < K)[:, None]
@@ -83,7 +85,7 @@ def _store_m(P, m00, m01, m10, m11, K: tl.constexpr, K1P: tl.constexpr, V: tl.co
   if V1 > 0:
     b = V0 + tl.arange(0, V1)
     bm = (b < V)[None, :]
-    tl.store(P + k0[:, None] * V + b[None, :], m01, mask=bm)
+    tl.store(P + k0[:, None] * V + b[None, :], m01, mask=km0 & bm)
     if K > 64:
       tl.store(P + k1[:, None] * V + b[None, :], m11, mask=km & bm)
 
@@ -96,13 +98,14 @@ def _write_pair(row, C, s_c, CB, s_cb, h_cb, G, s_g, GB, A, s_a, write_eps, HAS_
   n = tl.arange(0, NP)
   nm = n < N
   k0 = tl.arange(0, 64)
-  c0 = tl.load(C + row * s_c + n[:, None] * K + k0[None, :], mask=nm[:, None], other=0.).to(tl.float32)
+  km0 = (k0 < K)[None, :]
+  c0 = tl.load(C + row * s_c + n[:, None] * K + k0[None, :], mask=nm[:, None] & km0, other=0.).to(tl.float32)
   if K > 64:
     k1 = 64 + tl.arange(0, K1P)
     c1 = tl.load(C + row * s_c + n[:, None] * K + k1[None, :], mask=nm[:, None] & (k1 < K)[None, :],
                  other=0.).to(tl.float32)
   if HAS_CB:     # content = C + CB (attention output + local O, the o_head sum rounded as materialized)
-    c0 = (c0 + tl.load(CB + row * s_cb + n[:, None] * h_cb + k0[None, :], mask=nm[:, None],
+    c0 = (c0 + tl.load(CB + row * s_cb + n[:, None] * h_cb + k0[None, :], mask=nm[:, None] & km0,
                        other=0.).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
     if K > 64:
       c1 = (c1 + tl.load(CB + row * s_cb + n[:, None] * h_cb + k1[None, :], mask=nm[:, None] & (k1 < K)[None, :],
@@ -199,6 +202,7 @@ def _group_read(group, row, seq, pos, c, cm, r0, r1, f00, f01, f10, f11, inv, ST
   """Rows c (of the group's 2N (arm, head) rows) of arm group 0 (q, k) or 1 (v, local o) for one token,
   from its read keys, the bf16 read view tiles and its inverse RMS."""
   k0 = tl.arange(0, 64)
+  km0 = k0 < K
   o0 = tl.dot(r0, tl.trans(f00))          # [CRP, 64]
   if K > 64:
     k1 = 64 + tl.arange(0, K1P)
@@ -228,7 +232,7 @@ def _group_read(group, row, seq, pos, c, cm, r0, r1, f00, f01, f10, f11, inv, ST
     ra = ((sa * cs[None, :] - sb * sn[None, :]) * qm[:, None]).to(tl.bfloat16)
     rb = ((sb * cs[None, :] + sa * sn[None, :]) * qm[:, None]).to(tl.bfloat16)
     base = QK + row * s_qk + c[:, None] * QW
-    tl.store(base + k0[None, :], y0, mask=sm)
+    tl.store(base + k0[None, :], y0, mask=sm & km0[None, :])
     if K > 64:
       tl.store(base + k1[None, :], y1, mask=sm & km1[None, :])
     tl.store(base + K + j[None, :], ra, mask=sm & jm[None, :])
@@ -240,7 +244,7 @@ def _group_read(group, row, seq, pos, c, cm, r0, r1, f00, f01, f10, f11, inv, ST
     if CACHE:      # one-token decode: the key rows go to the key cache at position pos
       kmask = sm & (arm == 1)[:, None]
       kb = KC + seq * skb + head[:, None] * skh + pos * sks
-      tl.store(kb + k0[None, :], y0, mask=kmask)
+      tl.store(kb + k0[None, :], y0, mask=kmask & km0[None, :])
       if K > 64:
         tl.store(kb + k1[None, :], y1, mask=kmask & km1[None, :])
       tl.store(kb + K + j[None, :], ra, mask=kmask & jm[None, :])
@@ -249,14 +253,14 @@ def _group_read(group, row, seq, pos, c, cm, r0, r1, f00, f01, f10, f11, inv, ST
     sv = inv * vo_scale
     y0 = (o0 * sv).to(tl.bfloat16)
     base = VO + row * s_vo + c[:, None] * VW
-    tl.store(base + k0[None, :], y0, mask=sm)
+    tl.store(base + k0[None, :], y0, mask=sm & (k0 < VW)[None, :])
     if K > 64:
       y1 = (o1 * sv).to(tl.bfloat16)
       tl.store(base + k1[None, :], y1, mask=sm & (k1 < VW)[None, :])     # columns K..VW-1 are zero
     if CACHE:      # the value rows go to the value cache
       vmask = sm & (c < N)[:, None]
       vb = VC + seq * svb + head[:, None] * svh + pos * svs
-      tl.store(vb + k0[None, :], y0, mask=vmask)
+      tl.store(vb + k0[None, :], y0, mask=vmask & km0[None, :])
       if K > 64:
         tl.store(vb + k1[None, :], y1, mask=vmask & km1[None, :])
 
