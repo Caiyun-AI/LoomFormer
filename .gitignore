@@ -221,3 +221,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local training data & experiment outputs
+pytorch/data/
+pytorch/runs/

@@ -1,0 +1,56 @@
+# LoomFormer-XL (1,432,396,996 params; Paper Section 5.1 & Appendix D)
+#
+# Reproduce LoomFormer-XL on 8xA800-80GB:
+#   torchrun --standalone --nproc_per_node=8 pytorch/train_loom.py --config pytorch/configs/loomformer_xl.yml
+# Reproduce parameter-matched Llama-XL baseline (1,432,398,720 params):
+#   torchrun --standalone --nproc_per_node=8 pytorch/train_loom.py --config pytorch/configs/loomformer_xl.yml --no-loom \
+#     --out-dir pytorch/runs/llama_xl_seq4096_b128
+
+# Model architecture (D = 20 * 96 = 1920, L = 28)
+preset: "xl"
+loom_enabled: true
+vocab_size: 50432
+hidden_size: 1920
+num_layers: 28
+num_heads: 20
+head_dim: 96
+intermediate_size: 4048
+ffn_m_dim: 1827
+last_ffn_x_dim: 6277
+d_k: 40
+d_r: 400
+rope_dim: 24
+situ_beta1: 0.0
+situ_beta2: 0.0
+init_std: 0.006
+
+# Runtime & memory optimization
+compile: true
+compile_mode: "default"
+grad_checkpoint: true
+dtype: "bfloat16"
+
+# Schedule & optimizer (~26.21B tokens = 50000 steps * 524,288 tok/step; 8 GPUs: 8 * 8 * 2 = 128)
+seq_len: 4096
+batch_size: 128
+micro_batch_size: 8
+grad_accum: 2
+steps: 50000
+lr: 2.0e-4
+min_lr_ratio: 0.1
+warmup_steps: 500
+weight_decay: 0.1
+beta1: 0.9
+beta2: 0.95
+grad_clip: 1.0
+seed: 42
+
+# Data, evaluation & checkpointing
+num_train_shards: 103
+log_every: 25
+eval_every: 1000
+val_tokens: 2097152
+final_val_tokens: 10485760
+out_dir: "pytorch/runs/loomformer_xl_seq4096_b128"
+save_ckpt: true
+verify_inference: true

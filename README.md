@@ -1,6 +1,6 @@
 # LoomFormer
 
-This repository contains the official **JAX** training code and **PyTorch** (HuggingFace + Triton) inference code for our paper:
+This repository contains the official **JAX** (TPU Pallas) and **PyTorch** (HuggingFace + Triton) training and inference code for our paper:
 
 > **[Rewirable Circuits in Transformers with Loom Attention](https://arxiv.org/abs/2611.30634)**  
 > Da Xiao, Qingye Meng, Shengping Li, Xingyuan Yuan  
@@ -82,7 +82,7 @@ Beyond benchmark gains, we trace how the trained 300B-token **`LoomPythia-2.8B`*
 In practice, we train LoomFormer on Cloud TPUs for large-scale training efficiency and run inference on GPUs for deployment convenience:
 
 - **[`jax/`](jax/)**: Standalone JAX/Flax training package built on unmodified [AI-Hypercomputer/maxtext (`maxtext-v0.2.0`)](https://github.com/AI-Hypercomputer/maxtext/releases/tag/maxtext-v0.2.0) as an external dependency, cleanly separated into [`jax/loomformer/loomformer.py`](jax/loomformer/loomformer.py) (core `MShift`/`MRead`/`MWrite` primitives and Llama-backbone `LoomFormer` in a PyTorch-familiar `setup` + `__call__` layout), [`jax/loomformer/loompythia.py`](jax/loomformer/loompythia.py) (`LoomPythia`), and [`jax/loomformer/loom_pallas.py`](jax/loomformer/loom_pallas.py) (custom fused forward/backward TPU Pallas kernels). See [`jax/README.md`](jax/README.md).
-- **[`pytorch/`](pytorch/)**: HuggingFace-compatible PyTorch implementations (`loompythia/` and `loomformer/`), fused Triton inference kernels + CUDA-graph engine (`fast_inference/`), MaxText-to-HuggingFace checkpoint converter (`scripts/convert_maxtext_to_hf.py`), and test suite. See [`pytorch/README.md`](pytorch/README.md).
+- **[`pytorch/`](pytorch/)**: HuggingFace-compatible PyTorch implementations (`loompythia/` and `loomformer/`), fused Triton training engine + multi-GPU DDP pretraining (`training/engine.py`, `training/triton_ops.py`, `train_loom.py`, `configs/`), fused Triton + CUDA-graph inference engine (`fast_inference/`), MaxText-to-HuggingFace checkpoint converter (`scripts/convert_maxtext_to_hf.py`), and test suite. See [`pytorch/README.md`](pytorch/README.md).
 
 ## Citation
 

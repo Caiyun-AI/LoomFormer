@@ -1,0 +1,56 @@
+# LoomFormer-Medium (432,112,228 params; matched Llama-Medium: 432,121,200 params; Paper Section 5.1 & Appendix D)
+#
+# Reproduce LoomFormer-Medium on 8xA800-80GB:
+#   torchrun --standalone --nproc_per_node=8 pytorch/train_loom.py --config pytorch/configs/loomformer_medium.yml
+# Reproduce parameter-matched Llama-Medium baseline:
+#   torchrun --standalone --nproc_per_node=8 pytorch/train_loom.py --config pytorch/configs/loomformer_medium.yml --no-loom \
+#     --out-dir pytorch/runs/llama_medium_seq4096_b128
+
+# Model architecture (D = 16 * 75 = 1200, L = 18; d + r = 93 -> FA2 HEADDIM=96)
+preset: "medium"
+loom_enabled: true
+vocab_size: 50432
+hidden_size: 1200
+num_layers: 18
+num_heads: 16
+head_dim: 75
+intermediate_size: 2510
+ffn_m_dim: 1128
+last_ffn_x_dim: 3904
+d_k: 32
+d_r: 256
+rope_dim: 18
+situ_beta1: 0.0
+situ_beta2: 0.0
+init_std: 0.006
+
+# Runtime & memory optimization
+compile: true
+compile_mode: "default"
+grad_checkpoint: true
+dtype: "bfloat16"
+
+# Schedule & optimizer (~7.08B tokens = 13500 steps * 524,288 tok/step; 8 GPUs: 16 * 8 * 1 = 128)
+seq_len: 4096
+batch_size: 128
+micro_batch_size: 16
+grad_accum: 1
+steps: 13500
+lr: 3.0e-4
+min_lr_ratio: 0.1
+warmup_steps: 135
+weight_decay: 0.1
+beta1: 0.9
+beta2: 0.95
+grad_clip: 1.0
+seed: 42
+
+# Data, evaluation & checkpointing
+num_train_shards: 72
+log_every: 25
+eval_every: 500
+val_tokens: 2097152
+final_val_tokens: 10485760
+out_dir: "pytorch/runs/loomformer_medium_seq4096_b128"
+save_ckpt: true
+verify_inference: true
